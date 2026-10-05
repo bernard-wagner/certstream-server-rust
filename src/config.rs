@@ -231,7 +231,7 @@ pub struct CtLogConfig {
     /// HTTP User-Agent for outbound requests. Some CT log operators (e.g.
     /// Geomys) apply a more generous rate limit tier to clients that include
     /// a contact email. Unset or blank falls back to the compiled-in
-    /// `certstream-server-rust/{VERSION}`; read this through
+    /// `certstream-server-rust/{VERSION} (+https://github.com/reloading01/certstream-server-rust)`; read this through
     /// [`CtLogConfig::user_agent_override`] rather than directly.
     #[serde(default)]
     pub user_agent: Option<String>,

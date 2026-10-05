@@ -219,7 +219,7 @@ rate_limit:
 | `CERTSTREAM_CT_LOG_REQUEST_TIMEOUT_SECS` | `30` | Request timeout |
 | `CERTSTREAM_CT_LOG_BATCH_SIZE` | `1024` | Requested entries per `get-entries` call; servers may clamp it |
 | `CERTSTREAM_CT_LOG_FETCH_CONCURRENCY` | `4` | Concurrent range/tile fetches per watcher during catch-up, 1-16 |
-| `CERTSTREAM_USER_AGENT` | `certstream-server-rust/{VERSION}` | User-Agent for CT log and catalog requests |
+| `CERTSTREAM_USER_AGENT` | `certstream-server-rust/{VERSION} (+https://github.com/reloading01/certstream-server-rust)` | User-Agent for CT log and catalog requests |
 | `CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS` | none | Comma-separated operators that should use HTTP/1.1 |
 
 RFC 6962 and static-CT watchers can also be disabled independently with `CERTSTREAM_RFC6962_ENABLED` and `CERTSTREAM_STATIC_CT_ENABLED`.

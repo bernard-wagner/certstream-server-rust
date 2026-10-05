@@ -5,7 +5,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// User-Agent sent on every outbound HTTP request unless `ct_log.user_agent`
 /// overrides it. Built from the package version at compile time so the CT log
 /// fetch client and the TLS-pinned Apple catalog client can never drift apart.
-pub const DEFAULT_USER_AGENT: &str = concat!("certstream-server-rust/", env!("CARGO_PKG_VERSION"));
+/// The URL is how an operator reaches whoever runs the monitor; Geomys does not
+/// rate limit clients that give one.
+pub const DEFAULT_USER_AGENT: &str = concat!(
+    "certstream-server-rust/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/reloading01/certstream-server-rust)"
+);
 
 /// A finite replay of one log's index range, written out as JSONL. Parsed
 /// here rather than in `backfill` so a malformed invocation is rejected
