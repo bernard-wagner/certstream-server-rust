@@ -37,3 +37,5 @@ pub mod lag_policy;
 pub mod rate_limit;
 #[doc(hidden)]
 pub mod sse;
+#[doc(hidden)]
+pub mod tls;

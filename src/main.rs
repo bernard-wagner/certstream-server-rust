@@ -15,6 +15,7 @@ mod models;
 mod rate_limit;
 mod sse;
 mod state;
+mod tls;
 mod websocket;
 
 use axum::{http::header, middleware as axum_middleware, response::IntoResponse, routing::get, Router};
@@ -1507,6 +1508,14 @@ async fn run_tls_server(
                 return;
             }
         };
+
+    tokio::spawn(tls::reload_when_files_change(
+        tls_config.clone(),
+        cert_path.clone(),
+        key_path.clone(),
+        Duration::from_secs(60),
+        shutdown_token.clone(),
+    ));
 
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
