@@ -117,6 +117,12 @@ pub static MALLOC_CONF: &[u8] = b"narenas:4,dirty_decay_ms:5000,muzzy_decay_ms:5
 // Operators with extreme load can override via TOKIO_WORKER_THREADS env var.
 #[tokio::main(worker_threads = 4)]
 async fn main() {
+    // Two rustls providers are compiled in (the NATS client brings ring), and
+    // rustls refuses to pick one itself, which made enabling TLS panic.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("no rustls crypto provider is installed before startup");
+
     let cli_args = CliArgs::parse();
 
     if cli_args.show_help {

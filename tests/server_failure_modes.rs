@@ -239,3 +239,83 @@ fn corrupt_state_file_boots_under_fresh_recovery() {
         "default recovery must boot through a corrupt state file. stderr:\n{stderr}"
     );
 }
+
+/// v1.6.0 compiled a second rustls crypto provider into the binary (ring, by way
+/// of the NATS client), and from then on enabling TLS panicked at startup:
+/// rustls will not pick a default when it finds two. Every other test here
+/// uses plain HTTP, which never touched a provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_server_starts_and_completes_a_handshake() {
+    let Some(bin) = skip_if_no_binary() else { return };
+    // The client side needs a provider too, for the same reason.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let ca_key = rcgen::KeyPair::generate().unwrap();
+    let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test ca");
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = rcgen::KeyPair::generate().unwrap();
+    let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, &rcgen::Issuer::new(ca_params, ca_key))
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("certstream-tls-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, leaf.pem()).unwrap();
+    std::fs::write(&key, leaf_key.serialize_pem()).unwrap();
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(&bin)
+        .env("CERTSTREAM_HOST", "127.0.0.1")
+        .env("CERTSTREAM_PORT", port.to_string())
+        .env("CERTSTREAM_TLS_CERT", &cert)
+        .env("CERTSTREAM_TLS_KEY", &key)
+        .env("CERTSTREAM_CT_LOG_STATE_FILE", dir.join("state.json"))
+        .env("CERTSTREAM_LOG_LEVEL", "error")
+        .env("CERTSTREAM_CONFIG", "/nonexistent")
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let mut served = false;
+    while start.elapsed() < Duration::from_secs(40) {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let mut stderr = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                use std::io::Read;
+                let _ = s.read_to_string(&mut stderr);
+            }
+            panic!("the server exited ({status}) instead of serving TLS. stderr:\n{stderr}");
+        }
+        if let Ok(resp) = client.get(format!("https://localhost:{port}/health")).send().await
+            && resp.status().is_success()
+        {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(served, "no TLS handshake succeeded within 40 s");
+}
