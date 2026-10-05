@@ -37,6 +37,8 @@ const SLOWEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// refusals at which the interval is slowed.
 const JUDGE_EVERY: u32 = 20;
 const SLOW_DOWN_AT_PERCENT: u32 = 25;
+/// Answers older than this no longer count towards the next judgement.
+const JUDGE_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// A burst of 429s from requests already in flight is one signal, not many.
 const BACKOFF_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long without a 429 before the interval starts coming down, and how
@@ -66,6 +68,8 @@ struct BucketState {
 struct Adapt {
     requests: u32,
     limited: u32,
+    window_start: Option<tokio::time::Instant>,
+    last_limited: Option<tokio::time::Instant>,
     last_backoff: Option<tokio::time::Instant>,
     last_step: Option<tokio::time::Instant>,
 }
@@ -143,21 +147,29 @@ impl OperatorLimiter {
 
     /// Operators answer a fraction of requests with 429 whatever the pace, so
     /// one answer is not a reason to slow down. Every `JUDGE_EVERY` requests
-    /// the interval is slowed if `SLOW_DOWN_AT` or more of them were refused.
+    /// the interval is slowed if `SLOW_DOWN_AT_PERCENT` or more of them were refused.
     fn observe(&self, limited: bool) {
         if self.floor_us == self.ceiling_us {
             return;
         }
         let heavy = {
+            let now = tokio::time::Instant::now();
             let mut adapt = self.adapt.lock();
+            if adapt.window_start.is_none_or(|t| now.duration_since(t) > JUDGE_WITHIN) {
+                adapt.window_start = Some(now);
+                adapt.requests = 0;
+                adapt.limited = 0;
+            }
             adapt.requests += 1;
-            adapt.limited += u32::from(limited);
+            if limited {
+                adapt.limited += 1;
+                adapt.last_limited = Some(now);
+            }
             if adapt.requests < JUDGE_EVERY {
                 return;
             }
             let heavy = adapt.limited * 100 >= adapt.requests * SLOW_DOWN_AT_PERCENT;
-            adapt.requests = 0;
-            adapt.limited = 0;
+            adapt.window_start = None;
             heavy
         };
         if heavy {
@@ -185,7 +197,10 @@ impl OperatorLimiter {
             return;
         }
         let mut adapt = self.adapt.lock();
-        let quiet = adapt.last_backoff.is_none_or(|t| now.duration_since(t) >= RECOVERY_QUIET);
+        let quiet = [adapt.last_backoff, adapt.last_limited]
+            .into_iter()
+            .flatten()
+            .all(|t| now.duration_since(t) >= RECOVERY_QUIET);
         let due = adapt.last_step.is_none_or(|t| now.duration_since(t) >= RECOVERY_STEP);
         if quiet && due {
             adapt.last_step = Some(now);
