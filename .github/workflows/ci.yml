@@ -120,6 +120,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # The Docker Hub page shows the README and a one line summary. Cosmetic, so
+      # a token without the right to edit the repository must not fail a release.
+      - name: Update the Docker Hub description
+        if: github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_IMAGE }}
+          short-description: "Certificate Transparency streaming server in Rust: WebSocket and SSE, RFC 6962 and static-ct-api."
+          readme-filepath: ./README.md
+          enable-url-completion: true
+
   # Prebuilt binaries for people who do not want a container. Linux targets are
   # static musl builds so they run on any glibc vintage; jemalloc is compiled
   # from source, hence build-base on the musl runners.
