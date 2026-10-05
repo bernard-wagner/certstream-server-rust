@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -14,6 +14,116 @@ use subtle::ConstantTimeEq;
 use crate::config::{AuthConfig, ConnectionLimitConfig};
 use crate::hot_reload::HotReloadManager;
 use crate::rate_limit::{RateLimitResult, RateLimiter};
+
+/// Proxies whose forwarding headers are believed. Behind a reverse proxy every
+/// connection arrives from the proxy's address, so the per-IP connection and
+/// request limits would treat all clients as one.
+#[derive(Debug, Default, Clone)]
+pub struct TrustedProxies(Vec<(IpAddr, u8)>);
+
+impl TrustedProxies {
+    /// Entries are single addresses or CIDR ranges, IPv4 or IPv6.
+    pub fn parse(entries: &[String]) -> Result<Self, String> {
+        entries
+            .iter()
+            .map(|entry| {
+                let (addr, prefix) = match entry.split_once('/') {
+                    Some((addr, prefix)) => (addr, Some(prefix)),
+                    None => (entry.as_str(), None),
+                };
+                let addr: IpAddr = addr
+                    .trim()
+                    .parse()
+                    .map_err(|_| format!("`{entry}` is not an IP address or CIDR range"))?;
+                let max = if addr.is_ipv4() { 32 } else { 128 };
+                let prefix = match prefix {
+                    Some(p) => p
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|p| *p <= max)
+                        .ok_or_else(|| format!("`{entry}` has an invalid prefix length"))?,
+                    None => max,
+                };
+                Ok((addr.to_canonical(), prefix))
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
+        self.0.iter().any(|(net, prefix)| match (net, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - u32::from(*prefix)).unwrap_or(0);
+                u32::from(*net) & mask == u32::from(ip) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - u32::from(*prefix)).unwrap_or(0);
+                u128::from(*net) & mask == u128::from(ip) & mask
+            }
+            _ => false,
+        })
+    }
+
+    /// The address a request should be attributed to.
+    ///
+    /// Headers are read only when the TCP peer is a trusted proxy. The
+    /// `X-Forwarded-For` list is read from the right, skipping addresses that
+    /// are trusted proxies themselves, and the first one that is not is the
+    /// client: everything to its left was written by the client or by hops
+    /// nobody here vouches for, and can be forged. If every entry is a trusted
+    /// proxy the leftmost is used, then `X-Real-IP`, then the peer.
+    pub fn client_ip(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+        if !self.contains(peer) {
+            return peer;
+        }
+        let hops: Vec<&str> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .collect();
+        for hop in hops.iter().rev() {
+            match hop.parse::<IpAddr>() {
+                Ok(ip) if self.contains(ip) => continue,
+                Ok(ip) => return ip,
+                Err(_) => return peer,
+            }
+        }
+        if let Some(ip) = hops.first().and_then(|hop| hop.parse::<IpAddr>().ok()) {
+            return ip;
+        }
+        headers
+            .get("x-real-ip")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(peer)
+    }
+}
+
+/// Replaces the connection's peer address with the client address behind a
+/// trusted proxy, so everything downstream that reads `ConnectInfo` limits and
+/// logs the real client without knowing about proxies.
+pub async fn resolve_client_ip(
+    State(trusted): State<Arc<TrustedProxies>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ConnectInfo(peer)) = req.extensions().get::<ConnectInfo<SocketAddr>>().copied() {
+        let ip = trusted.client_ip(peer.ip(), req.headers());
+        if ip != peer.ip() {
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(ip, peer.port())));
+        }
+    }
+    next.run(req).await
+}
 
 pub struct ConnectionLimiter {
     hot_reload: Option<Arc<HotReloadManager>>,
@@ -471,5 +581,115 @@ mod tests {
 
         assert!(enabled.is_enabled());
         assert!(!disabled.is_enabled());
+    }
+
+    fn proxies(entries: &[&str]) -> TrustedProxies {
+        let entries: Vec<String> = entries.iter().map(|e| e.to_string()).collect();
+        TrustedProxies::parse(&entries).unwrap()
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.append(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn trusted_proxy_entries_are_validated() {
+        assert!(TrustedProxies::parse(&["10.0.0.0/8".into(), "::1".into(), "2001:db8::/32".into()]).is_ok());
+        for bad in ["nope", "10.0.0.0/33", "10.0.0.0/x", "2001:db8::/129"] {
+            assert!(TrustedProxies::parse(&[bad.to_string()]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn without_a_trusted_proxy_the_peer_is_the_client() {
+        let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(TrustedProxies::default().client_ip(ip("198.51.100.7"), &h), ip("198.51.100.7"));
+        // A peer that is not a proxy cannot vouch for a header, so it cannot
+        // choose its own address.
+        assert_eq!(proxies(&["10.0.0.0/8"]).client_ip(ip("198.51.100.7"), &h), ip("198.51.100.7"));
+    }
+
+    #[test]
+    fn a_trusted_proxy_vouches_for_the_address_it_appended() {
+        let p = proxies(&["10.0.0.0/8"]);
+        let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &h), ip("203.0.113.9"));
+    }
+
+    /// The client wrote the left of the list; only what the proxy appended can
+    /// be trusted, so a forged leftmost address must not win.
+    #[test]
+    fn a_forged_leftmost_address_is_ignored() {
+        let p = proxies(&["10.0.0.0/8"]);
+        let h = headers(&[("x-forwarded-for", "192.0.2.66, 203.0.113.9, 10.0.0.2")]);
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &h), ip("203.0.113.9"));
+        // Split over two header lines it reads the same.
+        let h = headers(&[("x-forwarded-for", "192.0.2.66"), ("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &h), ip("203.0.113.9"));
+    }
+
+    #[test]
+    fn fallbacks_when_the_chain_names_no_outside_client() {
+        let p = proxies(&["10.0.0.0/8"]);
+        let all_proxies = headers(&[("x-forwarded-for", "10.1.1.1, 10.2.2.2")]);
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &all_proxies), ip("10.1.1.1"));
+        let real = headers(&[("x-real-ip", "203.0.113.9")]);
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &real), ip("203.0.113.9"));
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &HeaderMap::new()), ip("10.0.0.1"));
+        let junk = headers(&[("x-forwarded-for", "203.0.113.9, unknown")]);
+        assert_eq!(p.client_ip(ip("10.0.0.1"), &junk), ip("10.0.0.1"));
+    }
+
+    #[test]
+    fn an_ipv4_peer_mapped_into_ipv6_matches_its_ipv4_range() {
+        let p = proxies(&["10.0.0.0/8"]);
+        let h = headers(&[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(p.client_ip(ip("::ffff:10.0.0.1"), &h), ip("203.0.113.9"));
+    }
+
+    /// Through a real router: the limiter and the handlers downstream read
+    /// `ConnectInfo`, so the replaced address is what they see.
+    #[tokio::test]
+    async fn the_middleware_rewrites_the_address_downstream_handlers_see() {
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/", get(|ConnectInfo(addr): ConnectInfo<SocketAddr>| async move { addr.ip().to_string() }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(proxies(&["10.0.0.0/8"])),
+                resolve_client_ip,
+            ));
+
+        let ask = |peer: &str, forwarded: &str| {
+            let mut req = axum::http::Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", forwarded)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(ip(peer), 4000)));
+            req
+        };
+        let body = |resp: Response| async move {
+            String::from_utf8(
+                axum::body::to_bytes(resp.into_body(), 1024).await.unwrap().to_vec(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(body(app.clone().oneshot(ask("10.0.0.1", "203.0.113.9")).await.unwrap()).await, "203.0.113.9");
+        assert_eq!(body(app.oneshot(ask("198.51.100.7", "203.0.113.9")).await.unwrap()).await, "198.51.100.7");
     }
 }

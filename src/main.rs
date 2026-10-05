@@ -37,7 +37,10 @@ use ct::{fetch_log_list, WatcherContext};
 use dedup::DedupFilter;
 use health::{deep_health, example_json, health, HealthState};
 use hot_reload::{HotReloadManager, HotReloadableConfig};
-use middleware::{auth_middleware, rate_limit_middleware, AuthMiddleware, ConnectionLimiter};
+use middleware::{
+    auth_middleware, rate_limit_middleware, resolve_client_ip, AuthMiddleware, ConnectionLimiter,
+    TrustedProxies,
+};
 use models::PreSerializedMessage;
 use rate_limit::RateLimiter;
 use sse::handle_sse_stream;
@@ -1469,10 +1472,21 @@ fn build_router(protocols: &config::ProtocolConfig, config: &Config, deps: Route
             .allow_headers(CorsAny),
     );
 
-    Router::new()
+    let router = Router::new()
         .merge(public_app)
         .merge(protected_app)
-        .fallback(handler_404)
+        .fallback(handler_404);
+
+    let trusted_proxies = TrustedProxies::parse(&config.trusted_proxies)
+        .expect("trusted_proxies was checked when the configuration was validated");
+    if trusted_proxies.is_empty() {
+        return router;
+    }
+    // Outermost, so the limiters and handlers all see the resolved client.
+    router.layer(axum_middleware::from_fn_with_state(
+        Arc::new(trusted_proxies),
+        resolve_client_ip,
+    ))
 }
 
 async fn run_tls_server(

@@ -138,6 +138,13 @@ connection_limit:
   max_connections: 10000
   per_ip_limit: null
 
+# Behind a reverse proxy every connection comes from the proxy's address, so
+# the per-IP limits above would count all clients as one. List the proxies
+# here (addresses or CIDR ranges) and the client address is read from
+# X-Forwarded-For, taking the last entry that is not one of these proxies
+# (env: CERTSTREAM_TRUSTED_PROXIES, comma-separated). Empty trusts nothing.
+trusted_proxies: []
+
 rate_limit:
   enabled: false
 

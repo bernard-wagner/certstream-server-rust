@@ -821,6 +821,10 @@ pub struct Config {
     pub protocols: ProtocolConfig,
     pub ct_log: CtLogConfig,
     pub connection_limit: ConnectionLimitConfig,
+    /// Proxies, as IP addresses or CIDR ranges, whose `X-Forwarded-For` and
+    /// `X-Real-IP` headers are believed when working out a client's address.
+    /// Empty means the TCP peer is always the client.
+    pub trusted_proxies: Vec<String>,
     pub rate_limit: RateLimitConfig,
     pub api: ApiConfig,
     pub auth: AuthConfig,
@@ -849,6 +853,8 @@ struct YamlConfig {
     ct_log: Option<CtLogConfig>,
     #[serde(default)]
     connection_limit: Option<ConnectionLimitConfig>,
+    #[serde(default)]
+    trusted_proxies: Vec<String>,
     #[serde(default)]
     rate_limit: Option<RateLimitConfig>,
     #[serde(default)]
@@ -957,6 +963,11 @@ impl Config {
         env_override!(connection_limit.max_connections, "CERTSTREAM_CONNECTION_LIMIT_MAX_CONNECTIONS");
         env_override!(connection_limit.per_ip_limit, "CERTSTREAM_CONNECTION_LIMIT_PER_IP_LIMIT", ok_opt);
 
+        let mut trusted_proxies = yaml_config.trusted_proxies;
+        if let Ok(v) = env::var("CERTSTREAM_TRUSTED_PROXIES") {
+            trusted_proxies = parse_operator_list(&v);
+        }
+
         let mut rate_limit = yaml_config.rate_limit.unwrap_or_default();
         env_override!(rate_limit.enabled, "CERTSTREAM_RATE_LIMIT_ENABLED");
 
@@ -1004,6 +1015,7 @@ impl Config {
             protocols,
             ct_log,
             connection_limit,
+            trusted_proxies,
             rate_limit,
             api,
             auth,
@@ -1017,6 +1029,13 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), Vec<ConfigValidationError>> {
         let mut errors = Vec::new();
+
+        if let Err(message) = crate::middleware::TrustedProxies::parse(&self.trusted_proxies) {
+            errors.push(ConfigValidationError {
+                field: "trusted_proxies".to_string(),
+                message,
+            });
+        }
 
         if self.port == 0 {
             errors.push(ConfigValidationError {
@@ -1179,6 +1198,7 @@ mod tests {
             protocols: ProtocolConfig::default(),
             ct_log: CtLogConfig::default(),
             connection_limit: ConnectionLimitConfig::default(),
+            trusted_proxies: Vec::new(),
             rate_limit: RateLimitConfig::default(),
             api: ApiConfig::default(),
             auth: AuthConfig::default(),
