@@ -90,17 +90,17 @@ ct_log:
   # you've fully cut over to static-ct logs (env: CERTSTREAM_RFC6962_ENABLED).
   rfc6962_enabled: true
   static_ct_enabled: true
-  # Per-operator outbound rate limit. default_operator_rate_limit_ms applies to
-  # any operator absent from operator_rate_limits. It is one budget per
-  # operator, shared by all of that operator's logs, and it is what bounds how
-  # fast the server can read a busy log. The default reads roughly half of what
-  # the CT ecosystem produces. Lowering it for operators that serve heavy
-  # monitoring traffic catches up faster, for example:
+  # Per-operator outbound request interval. default_operator_rate_limit_ms
+  # applies to any operator absent from operator_rate_limits. It is the
+  # fastest an operator is asked, one budget shared by all of that operator's
+  # logs. An operator that answers 429 is slowed from there (by a quarter per
+  # answer, up to one second) and sped up again once it stays quiet, so the
+  # value only needs raising to hold a particular operator to a gentler pace:
   #   operator_rate_limits:
-  #     google: 250
-  #     digicert: 250
-  # Keep it higher for small operators, and watch certstream_ct_log_rate_limited_total.
-  default_operator_rate_limit_ms: 500
+  #     geomys: 1000
+  # Watch certstream_ct_log_rate_limited_total and
+  # certstream_operator_request_interval_ms.
+  default_operator_rate_limit_ms: 25
   operator_rate_limits: {}
   # User-Agent for all outbound HTTP. Some operators (e.g. Geomys) apply a
   # more generous rate limit tier to clients that include a contact email.

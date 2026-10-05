@@ -63,7 +63,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // jemalloc defaults, read before main() runs. Every one of these was measured
 // on the live ingest workload (45 CT logs, ~420 certs/s, one subscriber);
 // stock defaults gave 358 MiB RSS against a 52 MiB live heap, these give
-// ~85 MiB (and ~35 MiB since the allocator cache and decay settings below).
+// ~85 MiB. The allocator cache and decay settings below, with the compact
+// dedup set, bring the idle container to about 40 MiB.
 //
 //   thp:never
 //     The big one. With transparent huge pages in `always` mode (the default
@@ -1181,7 +1182,7 @@ fn spawn_pool(
             Arc::new(ct::OperatorLimiter::adaptive(
                 op.clone(),
                 Duration::from_millis(ms),
-                ctx.config.fetch_concurrency,
+                ctx.config.fetch_concurrency.min(4),
             ))
         });
         log_tracker.register(

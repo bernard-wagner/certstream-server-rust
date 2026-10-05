@@ -23,21 +23,21 @@ use tokio_util::sync::CancellationToken;
 /// lets a watcher pipeline `fetch_concurrency` get-entries/tile fetches.
 ///
 /// The interval is not fixed. It starts at the configured floor, the fastest
-/// the operator is asked, and follows what the operator says: a 429 doubles
-/// it, up to a ceiling, and a quiet stretch speeds it up again by a tenth at a
-/// time. An operator that serves heavy monitoring traffic is then read at full
+/// the operator is asked, and follows what the operator says: a 429 slows
+/// it by a quarter, up to a ceiling, and a quiet stretch speeds it up again by a
+/// tenth at a time. An operator that serves heavy monitoring traffic is then read at full
 /// speed, and one that rate limits is slowed to what it tolerates without a
 /// number having to be guessed for every operator in advance.
 pub type OperatorRateLimiter = Arc<OperatorLimiter>;
 
 /// The slowest an operator is ever slowed to.
-const SLOWEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+const SLOWEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// A burst of 429s from requests already in flight is one signal, not many.
 const BACKOFF_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long without a 429 before the interval starts coming down, and how
 /// often it steps down after that.
-const RECOVERY_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
-const RECOVERY_STEP: std::time::Duration = std::time::Duration::from_secs(10);
+const RECOVERY_QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+const RECOVERY_STEP: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub struct OperatorLimiter {
     state: tokio::sync::Mutex<BucketState>,
@@ -144,7 +144,7 @@ impl OperatorLimiter {
             return;
         }
         adapt.last_backoff = Some(now);
-        self.publish(current.saturating_mul(2).min(self.ceiling_us));
+        self.publish((current + current / 4).min(self.ceiling_us));
     }
 
     fn recover_at(&self, now: tokio::time::Instant) {
@@ -531,20 +531,20 @@ mod broadcast_tests {
     }
 
     #[test]
-    fn a_429_doubles_the_interval_once_per_window() {
-        let l = adaptive(50);
+    fn a_429_slows_the_interval_by_a_quarter_once_per_window() {
+        let l = adaptive(100);
         let t0 = tokio::time::Instant::now();
-        assert_eq!(interval_ms(&l), 50);
+        assert_eq!(interval_ms(&l), 100);
 
         l.back_off_at(t0);
-        assert_eq!(interval_ms(&l), 100);
+        assert_eq!(interval_ms(&l), 125);
         // Requests already in flight answer 429 too: one signal, not three.
         l.back_off_at(t0 + std::time::Duration::from_millis(200));
         l.back_off_at(t0 + std::time::Duration::from_millis(900));
-        assert_eq!(interval_ms(&l), 100);
+        assert_eq!(interval_ms(&l), 125);
 
         l.back_off_at(t0 + std::time::Duration::from_secs(2));
-        assert_eq!(interval_ms(&l), 200);
+        assert_eq!(interval_ms(&l), 156);
     }
 
     #[test]
@@ -564,20 +564,21 @@ mod broadcast_tests {
         let t0 = tokio::time::Instant::now();
         l.back_off_at(t0);
         l.back_off_at(t0 + std::time::Duration::from_secs(2));
-        assert_eq!(interval_ms(&l), 400);
+        l.back_off_at(t0 + std::time::Duration::from_secs(4));
+        assert_eq!(interval_ms(&l), 195);
 
         // Not quiet long enough yet.
-        l.recover_at(t0 + std::time::Duration::from_secs(20));
-        assert_eq!(interval_ms(&l), 400);
+        l.recover_at(t0 + std::time::Duration::from_secs(6));
+        assert_eq!(interval_ms(&l), 195);
 
         // Quiet: a tenth faster each step, no more often than every step.
-        let mut t = t0 + std::time::Duration::from_secs(40);
+        let mut t = t0 + std::time::Duration::from_secs(10);
         l.recover_at(t);
-        assert_eq!(interval_ms(&l), 360);
-        l.recover_at(t + std::time::Duration::from_secs(3));
-        assert_eq!(interval_ms(&l), 360, "a step is not repeated inside RECOVERY_STEP");
+        assert_eq!(interval_ms(&l), 175);
+        l.recover_at(t + std::time::Duration::from_millis(500));
+        assert_eq!(interval_ms(&l), 175, "a step is not repeated inside RECOVERY_STEP");
 
-        for _ in 0..60 {
+        for _ in 0..80 {
             t += RECOVERY_STEP;
             l.recover_at(t);
         }

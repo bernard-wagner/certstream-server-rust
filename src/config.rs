@@ -468,7 +468,7 @@ fn parse_operator_list(raw: &str) -> Vec<String> {
 }
 
 fn default_operator_rate_limit_ms() -> u64 {
-    500
+    25
 }
 
 fn default_retry_max_attempts() -> u32 {
