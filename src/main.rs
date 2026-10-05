@@ -63,7 +63,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // jemalloc defaults, read before main() runs. Every one of these was measured
 // on the live ingest workload (45 CT logs, ~420 certs/s, one subscriber);
 // stock defaults gave 358 MiB RSS against a 52 MiB live heap, these give
-// ~85 MiB.
+// ~85 MiB (and ~35 MiB since the allocator cache and decay settings below).
 //
 //   thp:never
 //     The big one. With transparent huge pages in `always` mode (the default
@@ -86,10 +86,17 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //     so idle arenas held dirty pages indefinitely. This gives them a purger
 //     that runs regardless.
 //
-//   dirty_decay_ms / muzzy_decay_ms:5000
-//     Half the 10 s default. Catch-up bursts free multi-MB buffers all at
-//     once; returning them sooner costs a little purge CPU and keeps the
-//     resident curve flat.
+//   dirty_decay_ms / muzzy_decay_ms:0
+//     Catch-up bursts free multi-MB buffers all at once, and every second a
+//     freed page stays resident is memory the process holds for nothing.
+//     Returned at once, with the background purger doing the work, it cost
+//     about 0.01 core at ~400 certs/s and took 10 MiB off the idle size.
+//
+//   tcache:false
+//     jemalloc keeps freed objects in a cache per thread, and with the
+//     runtime's workers plus its blocking pool that was 20 to 25 MiB of idle
+//     memory. Measured on the live workload, same logs, seven minutes, no
+//     subscribers: 73 MiB with it, 46 MiB without, at the same CPU.
 //
 // These are defaults, not policy: jemalloc applies `_RJEM_MALLOC_CONF` from
 // the environment after this symbol, so operators can still override any of
@@ -106,13 +113,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] =
-    b"thp:never,narenas:4,background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+    b"thp:never,narenas:4,background_thread:true,tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 #[cfg(all(not(target_env = "msvc"), not(target_os = "linux")))]
 #[used]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static MALLOC_CONF: &[u8] = b"narenas:4,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+pub static MALLOC_CONF: &[u8] = b"narenas:4,tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 // CT polling + WS broadcast are heavily I/O-bound; CPU work is bursty (JSON
 // parse + cert deserialise) and cheap relative to the network wait. 4 worker
