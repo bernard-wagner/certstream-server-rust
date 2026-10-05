@@ -244,6 +244,15 @@ pub struct CtLogConfig {
     /// canonicalized with the same rules as `operator_rate_limits`.
     #[serde(default)]
     pub force_http1_operators: Vec<String>,
+    /// Operators whose catalog logs are never monitored. Names are
+    /// canonicalized like `operator_rate_limits` keys. Logs configured by hand
+    /// in `static_logs` or `custom_logs` are not affected.
+    #[serde(default)]
+    pub excluded_operators: Vec<String>,
+    /// Individual catalog logs that are never monitored, by monitoring URL as
+    /// `/api/logs` shows it. Excluded logs are not contacted at all.
+    #[serde(default)]
+    pub excluded_logs: Vec<String>,
     /// Per-catalog-source runtime-authority overrides. Keys are the catalog
     /// registry source names (`google_v3_usable`, `google_v3_all`, `apple`).
     /// An override can only grant authority to a source that currently verifies;
@@ -439,6 +448,8 @@ impl Default for CtLogConfig {
             operator_rate_limits: std::collections::HashMap::new(),
             user_agent: None,
             force_http1_operators: Vec::new(),
+            excluded_operators: Vec::new(),
+            excluded_logs: Vec::new(),
             catalog_authority_overrides: std::collections::HashMap::new(),
         }
     }
@@ -956,6 +967,12 @@ impl Config {
         env_override!(ct_log.user_agent, "CERTSTREAM_USER_AGENT", some_str);
         if let Ok(v) = env::var("CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS") {
             ct_log.force_http1_operators = parse_operator_list(&v);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_EXCLUDED_OPERATORS") {
+            ct_log.excluded_operators = parse_operator_list(&v);
+        }
+        if let Ok(v) = env::var("CERTSTREAM_CT_LOG_EXCLUDED_LOGS") {
+            ct_log.excluded_logs = parse_operator_list(&v);
         }
 
         let mut connection_limit = yaml_config.connection_limit.unwrap_or_default();

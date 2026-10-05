@@ -120,6 +120,12 @@ ct_log:
   # than raising it. Names are matched like operator_rate_limits keys.
   # (env: CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS, comma-separated)
   force_http1_operators: []
+  # Catalog logs that are never monitored or contacted: every log of an
+  # operator, or single logs by the URL /api/logs shows. Handy for operators
+  # that refuse you, or to cut CPU and bandwidth. Logs in static_logs are not
+  # affected. (env: CERTSTREAM_CT_LOG_EXCLUDED_OPERATORS / _EXCLUDED_LOGS)
+  excluded_operators: []
+  excluded_logs: []
   # Per-catalog-source runtime-authority overrides. Keys are
   # google_v3_usable, google_v3_all, and apple. An override can only grant
   # authority to a source that currently verifies; it cannot promote an

@@ -4,7 +4,7 @@ use crate::ct::normalize::{normalize_log_origin, normalize_operator, normalize_u
 use futures::future::join_all;
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -521,6 +521,43 @@ fn count_unknown_state_enum(source_name: &str, state: Option<&LogState>) {
     }
 }
 
+/// Catalog logs the operator asked not to monitor: every log of an operator,
+/// or single logs by URL. Logs configured by hand are never excluded.
+#[derive(Debug, Default, Clone)]
+pub struct LogExclusions {
+    operators: HashSet<String>,
+    urls: HashSet<String>,
+}
+
+impl LogExclusions {
+    pub fn new(operators: &[String], urls: &[String]) -> Self {
+        Self {
+            operators: operators.iter().map(|o| normalize_operator(o)).collect(),
+            urls: urls.iter().map(|u| normalize_url(u)).collect(),
+        }
+    }
+
+    fn excludes(&self, log: &CtLog) -> bool {
+        self.operators.contains(&log.operator) || self.urls.contains(&log.normalized_url())
+    }
+
+    /// Entries that match none of `logs`. A typo in an exclusion otherwise
+    /// excludes nothing and says nothing.
+    fn unmatched(&self, logs: &[&CtLog]) -> Vec<String> {
+        let operators: HashSet<&str> = logs.iter().map(|l| l.operator.as_str()).collect();
+        let urls: HashSet<String> = logs.iter().map(|l| l.normalized_url()).collect();
+        let mut out: Vec<String> = self
+            .operators
+            .iter()
+            .filter(|o| !operators.contains(o.as_str()))
+            .cloned()
+            .chain(self.urls.iter().filter(|u| !urls.contains(*u)).cloned())
+            .collect();
+        out.sort();
+        out
+    }
+}
+
 /// What discovery resolved: the logs to run watchers for, and the catalog logs
 /// that did not answer the availability probe. The second set is kept apart
 /// rather than discarded, so a refresh can tell a log that is slow or
@@ -546,6 +583,7 @@ pub async fn fetch_log_list(
     custom_logs: Vec<CustomCtLog>,
     request_timeout: Duration,
     user_agent: &str,
+    exclusions: &LogExclusions,
 ) -> Result<DiscoveredLogs, LogListError> {
     // Apple has no detached signature, so it is fetched through a dedicated
     // client that pins the issuer-CA SPKI on top of WebPKI validation. If that
@@ -621,12 +659,22 @@ pub async fn fetch_log_list(
         return Err(LogListError::NoLogs);
     }
 
-    // Spawn candidates: runtime-authoritative and currently usable.
+    let unmatched = exclusions.unmatched(&merged.values().map(|(log, _)| log).collect::<Vec<_>>());
+    if !unmatched.is_empty() {
+        warn!(
+            unmatched = ?unmatched,
+            "excluded_operators / excluded_logs entries match no catalog log and have no effect"
+        );
+    }
+
+    // Spawn candidates: runtime-authoritative, currently usable, and not
+    // excluded. Excluded logs are dropped before the availability probe so
+    // they are never contacted.
     let candidate_logs: Vec<CtLog> = merged
         .into_values()
         .filter(|(_, authoritative)| *authoritative)
         .map(|(log, _)| log)
-        .filter(|l| l.is_usable())
+        .filter(|l| l.is_usable() && !exclusions.excludes(l))
         .collect();
     info!(
         count = candidate_logs.len(),
@@ -674,6 +722,41 @@ pub async fn fetch_log_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn log_of(operator: &str, url: &str) -> CtLog {
+        let mut log = make_test_log("test", url, None);
+        log.operator = normalize_operator(operator);
+        log
+    }
+
+    #[test]
+    fn exclusions_match_an_operator_or_a_url_and_nothing_else() {
+        let exclusions = LogExclusions::new(
+            &["Geomys".to_string(), "DigiCert, Inc.".to_string()],
+            &["ct.example.org/log2026/".to_string()],
+        );
+
+        assert!(exclusions.excludes(&log_of("geomys", "https://a.example/x")));
+        assert!(exclusions.excludes(&log_of("DigiCert Inc", "https://b.example/y")));
+        assert!(exclusions.excludes(&log_of("Other", "https://ct.example.org/log2026")));
+        assert!(!exclusions.excludes(&log_of("Other", "https://ct.example.org/log2027")));
+        assert!(!LogExclusions::default().excludes(&log_of("Geomys", "https://a.example/x")));
+    }
+
+    #[test]
+    fn a_typo_in_an_exclusion_is_reported() {
+        let exclusions = LogExclusions::new(
+            &["Geomys".to_string(), "Geomis".to_string()],
+            &["https://nowhere.example/log".to_string()],
+        );
+        let known = [log_of("Geomys", "https://a.example/x")];
+        let refs: Vec<&CtLog> = known.iter().collect();
+
+        assert_eq!(
+            exclusions.unmatched(&refs),
+            vec!["geomis".to_string(), "https://nowhere.example/log".to_string()]
+        );
+    }
 
     #[test]
     fn test_is_usable_no_state() {

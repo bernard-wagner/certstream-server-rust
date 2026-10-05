@@ -709,6 +709,10 @@ async fn resolve_logs(config: &Config, ctx: &WatcherContext) -> Result<ResolvedL
         config.custom_logs.clone(),
         Duration::from_secs(config.ct_log.request_timeout_secs),
         ctx.config.user_agent_override().unwrap_or(DEFAULT_USER_AGENT),
+        &ct::LogExclusions::new(
+            &config.ct_log.excluded_operators,
+            &config.ct_log.excluded_logs,
+        ),
     )
     .await
     .map_err(|e| format!("failed to fetch any CT log list: {e}"))?;
@@ -1052,6 +1056,7 @@ async fn run_backfill(request: Result<cli::BackfillArgs, String>, config: &Confi
         config.custom_logs.clone(),
         Duration::from_secs(config.ct_log.request_timeout_secs),
         &user_agent,
+        &ct::LogExclusions::default(),
     )
     .await
     {
