@@ -1,5 +1,37 @@
 # Release Notes
 
+## v1.6.2: TLS fix, memory and catch-up speed
+
+**Release date:** October 5, 2026
+
+### TLS listener
+
+With `tls.enabled` the server panicked on the first connection, because two rustls crypto providers were linked and none was installed. This affects v1.6.0 and v1.6.1. The provider is now installed at startup and a test covers the TLS path.
+
+### Memory
+
+Idle resident memory is about 40 MB instead of 70 to 80 MB under the same load (8 minute runs against the live logs, no subscribers, cgroup `anon` memory). Two changes account for it. The duplicate filter held every key for the whole window in a map with about 160 bytes per entry; it now keeps a 128 bit fingerprint per key in time slices, under 40 bytes per entry (the window and capacity settings are unchanged). jemalloc also keeps no per-thread cache and returns freed pages at once, which removed 20 to 25 MB at a small CPU cost.
+
+### Catch-up speed
+
+The per-operator request interval now follows the operator. `default_operator_rate_limit_ms` is 25 ms, the fastest an operator is asked. Every 429 slows its interval by a quarter, up to one second, and it speeds up by a tenth each second after five quiet seconds. `certstream_operator_request_interval_ms` reports the value in force. A burst of at most four requests per operator is allowed instead of `fetch_concurrency`. In 8 minute runs from a clean state the share of new entries read rose from 0.27 to 0.45 at the former 500 ms default to 0.6 to 0.8 at 25 ms. DigiCert, Sectigo and Geomys are still read at 0.05 to 0.4 of what they produce, because they answer 429, DigiCert with a 30 second `Retry-After`. Set `ct_log.operator_rate_limits` for a gentler pace.
+
+### Log exclusion
+
+`ct_log.excluded_operators` and `ct_log.excluded_logs` (`CERTSTREAM_CT_LOG_EXCLUDED_OPERATORS`, `CERTSTREAM_CT_LOG_EXCLUDED_LOGS`) drop catalog logs before any watcher starts. Entries that match nothing are logged at startup.
+
+### Reverse proxies
+
+`trusted_proxies` (`CERTSTREAM_TRUSTED_PROXIES`) lists the proxy addresses or networks whose `X-Forwarded-For` is believed. The client address used for connection limits and rate limits is the first address in the chain that is not a trusted proxy, so a forged leftmost entry is ignored.
+
+### Certificate reload
+
+The TLS certificate and key files are checked every 60 seconds and reloaded when they change, without dropping connections. A pair that fails to parse is kept out and the old one stays in use.
+
+### Docker Hub
+
+Images are also published to Docker Hub, with the repository description taken from the README.
+
 ## v1.6.1: Shutdown, catalog refresh and verification fixes
 
 **Release date:** October 4, 2026
