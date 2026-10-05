@@ -9,7 +9,7 @@ use tracing::{info, warn};
 /// `RustlsConfig` read them once, so the old certificate stayed in use until the
 /// process restarted. Polls the modification times of both files and reloads
 /// when either changes. A reload that fails, a pair caught half written for
-/// instance, keeps the certificate in use; the next change tries again.
+/// instance, keeps the certificate in use and is tried again on the next poll.
 pub async fn reload_when_files_change(
     config: RustlsConfig,
     cert: String,
@@ -30,9 +30,11 @@ pub async fn reload_when_files_change(
         if now == seen {
             continue;
         }
-        seen = now;
         match config.reload_from_pem_file(&cert, &key).await {
-            Ok(()) => info!(cert = %cert, "TLS certificate reloaded"),
+            Ok(()) => {
+                seen = now;
+                info!(cert = %cert, "TLS certificate reloaded");
+            }
             Err(e) => warn!(
                 cert = %cert,
                 error = %e,

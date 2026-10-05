@@ -22,11 +22,11 @@ The per-operator request interval now follows the operator. `default_operator_ra
 
 ### Reverse proxies
 
-`trusted_proxies` (`CERTSTREAM_TRUSTED_PROXIES`) lists the proxy addresses or networks whose `X-Forwarded-For` is believed. The client address used for connection limits and rate limits is the first address in the chain that is not a trusted proxy, so a forged leftmost entry is ignored.
+`trusted_proxies` (`CERTSTREAM_TRUSTED_PROXIES`) lists the proxy addresses or networks whose `X-Forwarded-For` is believed. The client address used for connection limits and rate limits is the first address that is not a trusted proxy, counting from the right of the chain, so a forged leftmost entry is ignored.
 
 ### Certificate reload
 
-The TLS certificate and key files are checked every 60 seconds and reloaded when they change, without dropping connections. A pair that fails to parse is kept out and the old one stays in use.
+The TLS certificate and key files are checked every 60 seconds and reloaded when they change, without dropping connections. A pair that cannot be loaded, for instance one caught half written, leaves the old certificate in use and is tried again at the next check.
 
 ### Docker Hub
 

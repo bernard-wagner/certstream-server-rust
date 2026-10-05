@@ -99,9 +99,8 @@ impl DedupFilter {
         true
     }
 
-    /// Applies expiry and the capacity bound, and publishes the gauges. Both
-    /// also happen on every `is_new`, so this only matters while nothing is
-    /// arriving.
+    /// Applies expiry and the capacity bound, and publishes the gauges. Expiry
+    /// also happens on every `is_new`; the capacity bound only here.
     pub fn cleanup(&self) {
         let now = Instant::now();
         let mut window = self.window.lock();
