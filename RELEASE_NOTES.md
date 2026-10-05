@@ -10,7 +10,7 @@ With `tls.enabled` the server panicked on the first connection, because two rust
 
 ### Memory
 
-Idle resident memory is about 40 MB instead of 70 to 80 MB under the same load (8 minute runs against the live logs, no subscribers, cgroup `anon` memory). Two changes account for it. The duplicate filter held every key for the whole window in a map with about 160 bytes per entry; it now keeps a 128 bit fingerprint per key in time slices, under 40 bytes per entry (the window and capacity settings are unchanged). jemalloc also keeps no per-thread cache and returns freed pages at once, which removed 20 to 25 MB. In 7 minute idle runs it cost 0.01 to 0.02 of one core (0.04 to 0.05 before, 0.05 to 0.07 after); it was not measured with subscribers connected.
+Idle resident memory is about 40 MB instead of 70 to 80 MB under the same load (8 minute runs against the live logs, no subscribers, cgroup `anon` memory). Two changes account for it. The duplicate filter held every key for the whole window in a map with about 160 bytes per entry; it now keeps a 128 bit fingerprint per key in time slices, under 40 bytes per entry (the window and capacity settings are unchanged). jemalloc also keeps no per-thread cache, which removed about 30 MB (78 to 46 MB in 7 minute idle runs) with no change in CPU, and returns freed pages within a second instead of five. Returning them at once saved another 9 MB but cost 0.01 core, so it is not the default.
 
 ### Catch-up speed
 

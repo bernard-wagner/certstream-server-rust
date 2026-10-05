@@ -87,11 +87,11 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //     so idle arenas held dirty pages indefinitely. This gives them a purger
 //     that runs regardless.
 //
-//   dirty_decay_ms / muzzy_decay_ms:0
-//     Catch-up bursts free multi-MB buffers all at once, and every second a
-//     freed page stays resident is memory the process holds for nothing.
-//     Returned at once, with the background purger doing the work, it cost
-//     about 0.01 core at ~400 certs/s and took 10 MiB off the idle size.
+//   dirty_decay_ms / muzzy_decay_ms:1000
+//     Catch-up bursts free multi-MB buffers all at once. Returning them within
+//     a second, with the background purger doing the work, took about 3 MiB
+//     off the idle size at no measurable CPU. Returning them at once took
+//     another 9 MiB but cost about 0.01 core, which was not worth it.
 //
 //   tcache:false
 //     jemalloc keeps freed objects in a cache per thread, and with the
@@ -114,13 +114,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static MALLOC_CONF: &[u8] =
-    b"thp:never,narenas:4,background_thread:true,tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0\0";
+    b"thp:never,narenas:4,background_thread:true,tcache:false,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
 #[cfg(all(not(target_env = "msvc"), not(target_os = "linux")))]
 #[used]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static MALLOC_CONF: &[u8] = b"narenas:4,tcache:false,dirty_decay_ms:0,muzzy_decay_ms:0\0";
+pub static MALLOC_CONF: &[u8] = b"narenas:4,tcache:false,dirty_decay_ms:1000,muzzy_decay_ms:1000\0";
 
 // CT polling + WS broadcast are heavily I/O-bound; CPU work is bursty (JSON
 // parse + cert deserialise) and cheap relative to the network wait. 4 worker
