@@ -1,6 +1,6 @@
 # certstream-server-rust
 
-> A Certificate Transparency log streaming server written in Rust. It monitors Chrome- and Apple-trusted CT logs and streams newly issued TLS certificates over WebSocket and SSE. It supports both RFC 6962 and static-ct-api logs in one binary and is compatible with clients written for certstream-server and certstream-server-go.
+> A Certificate Transparency log streaming server written in Rust. It monitors Chrome- and Apple-trusted CT logs and streams newly issued TLS certificates over WebSocket and SSE. It supports both RFC 6962 and static-ct-api logs in one binary and works with existing Certstream clients.
 
 Typical uses include phishing and typosquat detection, brand monitoring, attack surface discovery, threat intelligence pipelines, certificate inventory, and research on newly issued certificates.
 

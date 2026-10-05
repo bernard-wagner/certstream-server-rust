@@ -633,14 +633,6 @@ After tuning and soak testing:
 
 A 12-hour soak test completed with zero panics, restarts, or health-check failures, filtered 38.3M duplicates, and maintained a stable RSS plateau.
 
-Compared with `0rickyy0/certstream-server-go` using 100 WebSocket clients:
-
-| Metric | Rust v1.5.0 | Go |
-| --- | ---: | ---: |
-| Avg CPU | 13% | 38% |
-| Peak RSS | 118 MiB | 161 MiB |
-| Memory swing | ±5 MiB | ±66 MiB |
-
 ### Data integrity
 
 - **Dedup race:** `DedupFilter::is_new` now uses `DashMap::entry` for atomic check-and-insert. A regression test with 32 threads × 1000 calls confirms one successful insertion.

@@ -12,7 +12,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Certstream Server Rust - Real-Time Certificate Transparency Log Streaming</title>
-    <meta name="description" content="A Certificate Transparency streaming server written in Rust. Reads SSL/TLS certificates from Chrome- and Apple-trusted CT logs and streams them over WebSocket and SSE. Compatible with certstream-server and certstream-server-go clients. RFC 6962 and static-ct-api in a single binary.">
+    <meta name="description" content="A Certificate Transparency streaming server written in Rust. Reads SSL/TLS certificates from Chrome- and Apple-trusted CT logs and streams them over WebSocket and SSE. Works with existing Certstream clients. RFC 6962 and static-ct-api in a single binary.">
     <meta name="keywords" content="certstream, certstream server, certstream rust, certstream-server-rust, certificate transparency, CT logs, SSL certificates, TLS certificates, real-time streaming, websocket, sse, rust server">
     <meta name="author" content="reloading01">
     <meta name="robots" content="index, follow">
@@ -247,7 +247,7 @@
             <div class="wrap">
                 <div class="section-header">
                     <h2>Compatibility</h2>
-                    <p>The message format is the one Calidog's certstream-server and certstream-server-go use, so a client only needs a different WebSocket address.</p>
+                    <p>Existing Certstream clients work unchanged: a client only needs a different WebSocket address.</p>
                 </div>
                 <div class="code-examples">
                     <div class="code-example">
@@ -271,7 +271,7 @@ wscat -c <span class="str">wss://your-host:8080/</span></pre>
                     </div>
                 </div>
                 <p style="margin-top: 24px; color: var(--ink-2); font-size: 0.92rem; max-width: 72ch;">
-                    Message types, field names and the <code>leaf_cert</code> shape are unchanged, so a parser written for either of them keeps working. On top of that, this server reads static-ct-api logs and drops duplicates seen across logs. If you only want domain names, <code>/domains-only</code> sends about 100 to 500 bytes per message instead of 2 to 5 KB.
+                    Message types, field names and the <code>leaf_cert</code> shape are unchanged, so a parser written for the Certstream format keeps working. On top of that, this server reads static-ct-api logs and drops duplicates seen across logs. If you only want domain names, <code>/domains-only</code> sends about 100 to 500 bytes per message instead of 2 to 5 KB.
                 </p>
             </div>
         </section>

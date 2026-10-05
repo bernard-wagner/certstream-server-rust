@@ -131,7 +131,7 @@
                 <div class="features-list cols-2">
                     <div class="feature-item">
                         <h3>What it does</h3>
-                        <p>Certstream reads certificates from Certificate Transparency logs and streams them to connected clients. This Rust server uses the same message format as certstream-server (Elixir) and certstream-server-go, so existing clients work unchanged.</p>
+                        <p>Certstream reads certificates from Certificate Transparency logs and streams them to connected clients. This Rust server uses the Certstream message format, so existing clients work unchanged.</p>
                     </div>
                     <div class="feature-item">
                         <h3>Implementation notes</h3>
@@ -615,6 +615,7 @@ docker compose up -d</pre>
                         <tr><td><code>CERTSTREAM_CONNECTION_LIMIT_ENABLED</code></td><td>false</td><td>Enable connection limits</td></tr>
                         <tr><td><code>CERTSTREAM_CONNECTION_LIMIT_MAX_CONNECTIONS</code></td><td>10000</td><td>Max total connections</td></tr>
                         <tr><td><code>CERTSTREAM_CONNECTION_LIMIT_PER_IP_LIMIT</code></td><td>100</td><td>Max per IP</td></tr>
+                        <tr><td><code>CERTSTREAM_TRUSTED_PROXIES</code></td><td>none</td><td>Comma-separated IP addresses or CIDR ranges of reverse proxies whose <code>X-Forwarded-For</code> and <code>X-Real-IP</code> headers are believed. Without it, every client behind a proxy shares the proxy's address, and the per-IP limits apply to all of them together</td></tr>
                     </tbody>
                 </table>
 
@@ -647,6 +648,8 @@ docker compose up -d</pre>
                         <tr><td><code>CERTSTREAM_CT_LOG_FETCH_CONCURRENCY</code></td><td>4</td><td>Concurrent range/tile fetches per watcher during catch-up (1-16)</td></tr>
                         <tr><td><code>CERTSTREAM_USER_AGENT</code></td><td>certstream-server-rust/{VERSION}</td><td>User-Agent for all outbound HTTP. Some operators, Geomys among them, apply a higher rate limit tier to clients that include a contact email. GoDaddy limits by the product and version at the start of the string, and the default is shared by every install, so its logs are often refused with a 429: a name of your own, such as <code>yourname-monitor/1.0 (you@example.com)</code>, avoids it. A blank value falls back to the default.</td></tr>
                         <tr><td><code>CERTSTREAM_CT_LOG_FORCE_HTTP1_OPERATORS</code></td><td>none</td><td>Comma-separated operators whose watchers fetch over HTTP/1.1 instead of HTTP/2</td></tr>
+                        <tr><td><code>CERTSTREAM_CT_LOG_EXCLUDED_OPERATORS</code></td><td>none</td><td>Comma-separated operators whose catalog logs are not monitored, for example <code>geomys,godaddy</code>. Excluded logs are not contacted at all; logs in <code>static_logs</code> are unaffected</td></tr>
+                        <tr><td><code>CERTSTREAM_CT_LOG_EXCLUDED_LOGS</code></td><td>none</td><td>Comma-separated monitoring URLs of single catalog logs that are not monitored, as <code>/api/logs</code> shows them. An entry that matches no log is reported in the startup log</td></tr>
                         <tr><td><code>CERTSTREAM_STATIC_CT_CHECKPOINT_SIGNATURE</code></td><td>warn</td><td>Checkpoint signature policy: <code>warn</code> or <code>enforce</code></td></tr>
                         <tr><td><code>CERTSTREAM_DEDUP_CAPACITY</code></td><td>200000</td><td>Cross-log dedup capacity</td></tr>
                         <tr><td><code>CERTSTREAM_DEDUP_TTL_SECS</code></td><td>900</td><td>Dedup window (seconds)</td></tr>
