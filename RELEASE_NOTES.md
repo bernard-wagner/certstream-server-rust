@@ -10,11 +10,17 @@ With `tls.enabled` the server panicked on the first connection, because two rust
 
 ### Memory
 
-Idle resident memory is about 40 MB instead of 70 to 80 MB under the same load (8 minute runs against the live logs, no subscribers, cgroup `anon` memory). Two changes account for it. The duplicate filter held every key for the whole window in a map with about 160 bytes per entry; it now keeps a 128 bit fingerprint per key in time slices, under 40 bytes per entry (the window and capacity settings are unchanged). jemalloc also keeps no per-thread cache, which removed about 30 MB (78 to 46 MB in 7 minute idle runs) with no change in CPU, and returns freed pages within a second instead of five. Returning them at once saved another 9 MB but cost 0.01 core, so it is not the default.
+Idle resident memory is 43 MB at a read rate of about 1,600 entries per second, against 70 to 80 MB for v1.6.1 under the same load (8 minute runs against the live logs, no subscribers, cgroup `anon` memory). It was 53 to 58 MB in later runs that read 2,000 or more entries per second. Two changes account for it. The duplicate filter held every key for the whole window in a map with about 160 bytes per entry; it now keeps a 128 bit fingerprint per key in time slices, under 40 bytes per entry (the window and capacity settings are unchanged). jemalloc also keeps no per-thread cache, which removed about 30 MB (78 to 46 MB in 7 minute idle runs) with no change in CPU, and returns freed pages within a second instead of five. Returning them at once saved another 9 MB but cost 0.01 core, so it is not the default.
 
 ### Catch-up speed
 
-The per-operator request interval now follows the operator. `default_operator_rate_limit_ms` is 25 ms, the fastest an operator is asked. Every 429 slows its interval by a quarter, up to one second, and it speeds up by a tenth each second after five quiet seconds. `certstream_operator_request_interval_ms` reports the value in force. A burst of at most four requests per operator is allowed instead of `fetch_concurrency`. In 8 minute runs from a clean state the share of new entries read rose from 0.27 to 0.45 at the former 500 ms default to 0.6 to 0.8 at 25 ms. DigiCert, Sectigo and Geomys are still read at 0.05 to 0.4 of what they produce, because they answer 429, DigiCert with a 30 second `Retry-After`. Set `ct_log.operator_rate_limits` for a gentler pace.
+The share of new entries read, measured against each log's own checkpoint in 8 minute runs from a clean state, rose from 0.27 to 0.45 in v1.6.1 to 0.67 to 0.78.
+
+- `default_operator_rate_limit_ms` is 25 ms, the fastest an operator is asked, and the interval follows the operator. Every 20 requests it is slowed by a quarter, up to one second, if a quarter or more were answered with 429, and it speeds up by a tenth each second after five quiet seconds. `certstream_operator_request_interval_ms` reports the value in force. The burst per operator is at most four requests instead of `fetch_concurrency`.
+- A `Retry-After` given as an HTTP date was treated as unparseable, and a 429 without the header waited 30 seconds. Dates are now read, and a 429 with no hint waits 5 seconds. DigiCert answers 429 without the header, and Geomys sends a date.
+- The default User-Agent is now `certstream-server-rust/{version} (+https://github.com/reloading01/certstream-server-rust)`. Geomys applies a global limit of 75 requests per second to clients that give neither an email nor a URL. Twenty-five consecutive tile requests succeeded 12 times with the old agent and 25 times with a URL in it, and Geomys went from 0.01 to 1.00 of its entries read. Set `CERTSTREAM_USER_AGENT` to use your own contact.
+
+DigiCert, Sectigo and TrustAsia are still read at 0.4 to 0.6 of what they produce in most runs. Set `ct_log.operator_rate_limits` for a gentler pace.
 
 ### Log exclusion
 

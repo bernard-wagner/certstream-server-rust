@@ -780,19 +780,19 @@ docker compose up -d</pre>
                 </div>
                 <p style="margin-top: 1rem;">Throughput and resource use do not describe how current the stream is. Over the same run the median log sat about 20 minutes behind its head, and 19 of 45 logs were more than 5,000 entries behind, with no subscriber loss and no runaway growth. The delay rose during initial catch-up, peaked near 29 minutes, and then held. <code>certstream_ct_log_ingest_delay_seconds</code> and <code>certstream_ct_log_lag_entries</code> report both figures per log; <code>soak/measure.sh</code> samples them alongside CPU and RSS.</p>
                 <h3>Keeping up with the logs</h3>
-                <p>Each operator has one request interval shared by all of its logs, <code>ct_log.default_operator_rate_limit_ms</code> (25 ms). That is the fastest an operator is asked. Every 429 slows the interval by a quarter, up to one second, and it speeds up by a tenth each second once the operator has been quiet for five seconds. The value in force is exported as <code>certstream_operator_request_interval_ms</code>. Operators that serve heavy monitoring traffic are read at full speed, and operators that rate limit are slowed to what they tolerate without a number being guessed for each of them.</p>
-                <p>Two 8 minute runs from a clean state with no subscribers, measured against each log's own checkpoint, read between 60% and 65% of the entries the logs produced, with a mean of 0.17 of one core and 40 MB of resident memory. Share read per operator, from the two runs:</p>
+                <p>Each operator has one request interval shared by all of its logs, <code>ct_log.default_operator_rate_limit_ms</code> (25 ms). That is the fastest an operator is asked. Operators answer a share of requests with 429 whatever the pace, so every 20 requests the interval is judged: if a quarter or more were refused it slows by a quarter, up to one second, and it speeds up by a tenth each second once the operator has been quiet for five seconds. The value in force is exported as <code>certstream_operator_request_interval_ms</code>. A <code>Retry-After</code> in seconds or as an HTTP date is waited out by the log that received it, and a 429 without one waits five seconds.</p>
+                <p>Two 8 minute runs from a clean state with no subscribers, measured against each log's own checkpoint, read 67% and 78% of the entries the logs produced, using 0.16 to 0.18 of one core and 53 to 58 MB of resident memory. Share read per operator, from the two runs:</p>
                 <table class="endpoints-table">
                     <thead><tr><th>Operator</th><th>Share of new entries read</th></tr></thead>
                     <tbody>
-                        <tr><td>Let's Encrypt, IPng Networks</td><td>1.00</td></tr>
-                        <tr><td>Google</td><td>0.68 to 0.75</td></tr>
-                        <tr><td>DigiCert</td><td>0.31 to 0.39</td></tr>
-                        <tr><td>Sectigo</td><td>0.34</td></tr>
-                        <tr><td>Geomys</td><td>0.01 to 0.05</td></tr>
+                        <tr><td>Geomys, Let's Encrypt, IPng Networks, Microsec</td><td>1.00</td></tr>
+                        <tr><td>Google</td><td>0.64 to 0.78</td></tr>
+                        <tr><td>DigiCert</td><td>0.48 to 0.59</td></tr>
+                        <tr><td>Sectigo</td><td>0.43 to 0.55</td></tr>
+                        <tr><td>TrustAsia</td><td>0.38 to 0.58</td></tr>
                     </tbody>
                 </table>
-                <p>DigiCert serves 25 entries per request and answers 429 with a 30 second <code>Retry-After</code>, which the watcher of that log waits out. DigiCert serves 25 entries per request and answers 429 without a <code>Retry-After</code>. Geomys read little in these runs because the User-Agent of that build carried no contact, which Geomys limits globally; v1.6.2 sends the project URL, as Geomys asks, and the table above was measured before that change. Set <code>ct_log.operator_rate_limits</code> to hold an operator to a gentler pace, and watch <code>certstream_ct_log_rate_limited_total</code>.</p>
+                <p>The shares move from run to run with the load the operators are under; DigiCert read 0.95 to 1.02 in two earlier runs. DigiCert serves 25 entries per request and Google 32, so both need many requests per second. Geomys applies a global limit of 75 requests per second to clients that give neither an email nor a URL, so the default User-Agent carries the project URL. Set <code>ct_log.operator_rate_limits</code> to hold an operator to a gentler pace, and watch <code>certstream_ct_log_rate_limited_total</code>.</p>
                 <p style="margin-top: 24px; color: var(--ink-3); font-size: 0.9rem; max-width: 70ch;">
                     Results are specific to this benchmark and will vary by host and workload.
                 </p>

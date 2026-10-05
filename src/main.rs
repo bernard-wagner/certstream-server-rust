@@ -64,7 +64,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // on the live ingest workload (45 CT logs, ~420 certs/s, one subscriber);
 // stock defaults gave 358 MiB RSS against a 52 MiB live heap, these give
 // ~85 MiB. The allocator cache and decay settings below, with the compact
-// dedup set, bring the idle container to about 40 MiB.
+// dedup set, bring the idle container to 43 MiB at 1,600 entries/s.
 //
 //   thp:never
 //     The big one. With transparent huge pages in `always` mode (the default
