@@ -13,17 +13,26 @@ pub(super) fn source_id(log_id: Option<&str>, normalized_url: &str) -> String {
     }
 }
 
+/// `Retry-After` is either a number of seconds or an HTTP date (RFC 9110).
+fn retry_after_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs.saturating_mul(1_000));
+    }
+    let date = value
+        .strip_suffix(" GMT")
+        .or_else(|| value.strip_suffix(" UTC"))?;
+    let at = chrono::NaiveDateTime::parse_from_str(date, "%a, %d %b %Y %H:%M:%S").ok()?;
+    let wait = at.and_utc() - chrono::Utc::now();
+    Some(wait.num_milliseconds().max(0) as u64)
+}
+
 pub(super) fn parse_retry_after(headers: &HeaderMap, log_description: &str) -> u64 {
     let Some(header) = headers.get("retry-after") else {
         return LogHealth::RATE_LIMIT_BACKOFF_MS;
     };
 
-    let Some(requested_ms) = header
-        .to_str()
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map(|secs| secs.saturating_mul(1_000))
-    else {
+    let Some(requested_ms) = header.to_str().ok().and_then(retry_after_ms) else {
         metrics::counter!(
             "certstream_input_parse_rejected_total",
             "field" => "retry_after",
@@ -203,9 +212,27 @@ mod tests {
     }
 
     #[test]
-    fn http_date_form_uses_default_rate_limit_backoff() {
+    fn http_date_form_is_the_time_left_until_that_date() {
+        for suffix in ["GMT", "UTC"] {
+            let at = chrono::Utc::now() + chrono::Duration::seconds(20);
+            let value = format!("{} {suffix}", at.format("%a, %d %b %Y %H:%M:%S"));
+            let ms = parse_retry_after(&header(&value), "test-log");
+            assert!((18_000..=20_000).contains(&ms), "{suffix}: {ms}");
+        }
+    }
+
+    #[test]
+    fn http_date_in_the_past_clamps_to_minimum_floor() {
         assert_eq!(
-            parse_retry_after(&header("Wed, 21 Oct 2026 07:28:00 GMT"), "test-log"),
+            parse_retry_after(&header("Wed, 21 Oct 2015 07:28:00 GMT"), "test-log"),
+            MIN_RETRY_AFTER_MS
+        );
+    }
+
+    #[test]
+    fn garbage_uses_default_rate_limit_backoff() {
+        assert_eq!(
+            parse_retry_after(&header("soon"), "test-log"),
             LogHealth::RATE_LIMIT_BACKOFF_MS
         );
     }

@@ -60,7 +60,7 @@ impl LogHealth {
     const MIN_BACKOFF_MS: u64 = 1000;
     const MAX_BACKOFF_MS: u64 = 60000;
     const CIRCUIT_RESET_MS: u64 = 30000;
-    pub const RATE_LIMIT_BACKOFF_MS: u64 = 30_000;
+    pub const RATE_LIMIT_BACKOFF_MS: u64 = 5_000;
 
     pub fn new() -> Self {
         Self {
@@ -138,7 +138,7 @@ impl LogHealth {
     /// Record a 429/rate-limit using the backoff duration the server gave us in
     /// its `Retry-After` header (parsed + clamped by
     /// [`crate::ct::normalize::parse_retry_after`]). `backoff_ms` is already
-    /// canonicalized; the caller passes `RATE_LIMIT_BACKOFF_MS` (30s) when the
+    /// canonicalized; the caller passes `RATE_LIMIT_BACKOFF_MS` (5s) when the
     /// header is absent or unparseable.
     pub fn record_rate_limit_with_ms(&self, unhealthy_threshold: u32, backoff_ms: u64) {
         if backoff_ms == Self::RATE_LIMIT_BACKOFF_MS {
