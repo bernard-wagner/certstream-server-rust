@@ -23,15 +23,20 @@ use tokio_util::sync::CancellationToken;
 /// lets a watcher pipeline `fetch_concurrency` get-entries/tile fetches.
 ///
 /// The interval is not fixed. It starts at the configured floor, the fastest
-/// the operator is asked, and follows what the operator says: a 429 slows
-/// it by a quarter, up to a ceiling, and a quiet stretch speeds it up again by a
-/// tenth at a time. An operator that serves heavy monitoring traffic is then read at full
-/// speed, and one that rate limits is slowed to what it tolerates without a
-/// number having to be guessed for every operator in advance.
+/// the operator is asked, and follows what the operator says: when a quarter
+/// of its answers are 429 it slows by a quarter, up to a ceiling, and a quiet
+/// stretch speeds it up again by a tenth at a time. An operator that serves
+/// heavy monitoring traffic is then read at full speed, and one that rate
+/// limits is slowed to what it tolerates without a number having to be
+/// guessed for every operator in advance.
 pub type OperatorRateLimiter = Arc<OperatorLimiter>;
 
 /// The slowest an operator is ever slowed to.
 const SLOWEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Requests between judgements of how many were refused, and the share of
+/// refusals at which the interval is slowed.
+const JUDGE_EVERY: u32 = 20;
+const SLOW_DOWN_AT_PERCENT: u32 = 25;
 /// A burst of 429s from requests already in flight is one signal, not many.
 const BACKOFF_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long without a 429 before the interval starts coming down, and how
@@ -59,6 +64,8 @@ struct BucketState {
 
 #[derive(Default)]
 struct Adapt {
+    requests: u32,
+    limited: u32,
     last_backoff: Option<tokio::time::Instant>,
     last_step: Option<tokio::time::Instant>,
 }
@@ -125,12 +132,37 @@ impl OperatorLimiter {
 
     /// The operator answered 429: slow down.
     pub fn on_rate_limited(&self) {
-        self.back_off_at(tokio::time::Instant::now());
+        self.observe(true);
     }
 
     /// A request went through: speed up again once it has been quiet for a while.
     pub fn on_success(&self) {
+        self.observe(false);
         self.recover_at(tokio::time::Instant::now());
+    }
+
+    /// Operators answer a fraction of requests with 429 whatever the pace, so
+    /// one answer is not a reason to slow down. Every `JUDGE_EVERY` requests
+    /// the interval is slowed if `SLOW_DOWN_AT` or more of them were refused.
+    fn observe(&self, limited: bool) {
+        if self.floor_us == self.ceiling_us {
+            return;
+        }
+        let heavy = {
+            let mut adapt = self.adapt.lock();
+            adapt.requests += 1;
+            adapt.limited += u32::from(limited);
+            if adapt.requests < JUDGE_EVERY {
+                return;
+            }
+            let heavy = adapt.limited * 100 >= adapt.requests * SLOW_DOWN_AT_PERCENT;
+            adapt.requests = 0;
+            adapt.limited = 0;
+            heavy
+        };
+        if heavy {
+            self.back_off_at(tokio::time::Instant::now());
+        }
     }
 
     fn back_off_at(&self, now: tokio::time::Instant) {
@@ -583,6 +615,24 @@ mod broadcast_tests {
             l.recover_at(t);
         }
         assert_eq!(interval_ms(&l), 100, "recovery must stop at the floor");
+    }
+
+    #[test]
+    fn an_occasional_429_does_not_slow_the_interval_but_a_run_of_them_does() {
+        let l = adaptive(100);
+        for _ in 0..5 {
+            for _ in 0..JUDGE_EVERY - 2 {
+                l.observe(false);
+            }
+            l.observe(true);
+            l.observe(false);
+        }
+        assert_eq!(interval_ms(&l), 100, "1 in 20 refused is normal");
+
+        for _ in 0..JUDGE_EVERY {
+            l.observe(true);
+        }
+        assert_eq!(interval_ms(&l), 125);
     }
 
     #[test]
