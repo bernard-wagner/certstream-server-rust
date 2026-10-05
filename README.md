@@ -3,6 +3,7 @@
 A Certstream server written in Rust. It monitors Certificate Transparency (CT) logs and streams newly issued SSL/TLS certificates over WebSocket and Server-Sent Events (SSE).
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-reloading01%2Fcertstream--server--rust-blue?logo=github)](https://github.com/reloading01/certstream-server-rust/pkgs/container/certstream-server-rust)
+[![Docker Hub](https://img.shields.io/badge/docker%20hub-reloading01%2Fcertstream--server--rust-blue?logo=docker)](https://hub.docker.com/r/reloading01/certstream-server-rust)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ff69b4?logo=githubsponsors)](https://github.com/sponsors/reloading01)
@@ -110,6 +111,8 @@ Minimal:
 ```bash
 docker run -d -p 8080:8080 ghcr.io/reloading01/certstream-server-rust:latest
 ```
+
+The same image is on Docker Hub as `reloading01/certstream-server-rust`.
 
 With persistent state and connection limits:
 
