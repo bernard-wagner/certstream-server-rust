@@ -12,24 +12,44 @@ pub use normalize::normalize_operator;
 pub use parser::*;
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 /// Per-operator rate limiter to avoid hitting CT log rate limits.
 ///
-/// Token bucket: refilled at `1 / min_interval` Hz, holding at most `burst`
-/// tokens. The long-run request rate is therefore identical to the old
-/// one-permit design (one request per `min_interval`), but up to `burst`
-/// requests may start back-to-back — which is what lets a watcher pipeline
-/// `fetch_concurrency` get-entries/tile fetches without violating operator
-/// politeness over any window longer than the burst itself.
+/// Token bucket: refilled at `1 / interval` Hz, holding at most `burst`
+/// tokens, so up to `burst` requests may start back-to-back, which is what
+/// lets a watcher pipeline `fetch_concurrency` get-entries/tile fetches.
+///
+/// The interval is not fixed. It starts at the configured floor, the fastest
+/// the operator is asked, and follows what the operator says: a 429 doubles
+/// it, up to a ceiling, and a quiet stretch speeds it up again by a tenth at a
+/// time. An operator that serves heavy monitoring traffic is then read at full
+/// speed, and one that rate limits is slowed to what it tolerates without a
+/// number having to be guessed for every operator in advance.
 pub type OperatorRateLimiter = Arc<OperatorLimiter>;
+
+/// The slowest an operator is ever slowed to.
+const SLOWEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(4);
+/// A burst of 429s from requests already in flight is one signal, not many.
+const BACKOFF_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long without a 429 before the interval starts coming down, and how
+/// often it steps down after that.
+const RECOVERY_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+const RECOVERY_STEP: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct OperatorLimiter {
     state: tokio::sync::Mutex<BucketState>,
-    min_interval: std::time::Duration,
+    /// Fastest and slowest interval, in microseconds. Equal for a fixed limiter.
+    floor_us: u64,
+    ceiling_us: u64,
+    /// Interval in force, between the two.
+    interval_us: AtomicU64,
     burst: f64,
+    /// Operator key for the interval gauge; empty for no gauge.
+    name: String,
+    adapt: parking_lot::Mutex<Adapt>,
 }
 
 struct BucketState {
@@ -37,8 +57,29 @@ struct BucketState {
     last_refill: tokio::time::Instant,
 }
 
+#[derive(Default)]
+struct Adapt {
+    last_backoff: Option<tokio::time::Instant>,
+    last_step: Option<tokio::time::Instant>,
+}
+
 impl OperatorLimiter {
+    /// A limiter whose interval never changes.
+    #[cfg(test)]
     pub fn with_burst(min_interval: std::time::Duration, burst: u32) -> Self {
+        Self::build(String::new(), min_interval, min_interval, burst)
+    }
+
+    /// A limiter that starts at `floor` and slows down when the operator
+    /// answers 429.
+    pub fn adaptive(name: String, floor: std::time::Duration, burst: u32) -> Self {
+        let limiter = Self::build(name, floor, floor.max(SLOWEST_INTERVAL), burst);
+        limiter.publish(limiter.floor_us);
+        limiter
+    }
+
+    fn build(name: String, floor: std::time::Duration, ceiling: std::time::Duration, burst: u32) -> Self {
+        let floor_us = floor.as_micros() as u64;
         Self {
             // Seed with a full bucket so startup doesn't serialize the first
             // burst of requests (parity with the old "first tick is free").
@@ -46,21 +87,26 @@ impl OperatorLimiter {
                 tokens: burst.max(1) as f64,
                 last_refill: tokio::time::Instant::now(),
             }),
-            min_interval,
+            floor_us,
+            ceiling_us: ceiling.as_micros() as u64,
+            interval_us: AtomicU64::new(floor_us),
             burst: burst.max(1) as f64,
+            name,
+            adapt: parking_lot::Mutex::new(Adapt::default()),
         }
     }
 
     pub async fn tick(&self) {
-        if self.min_interval.is_zero() {
-            return;
-        }
         loop {
+            let interval_us = self.interval_us.load(Ordering::Relaxed);
+            if interval_us == 0 {
+                return;
+            }
+            let interval = std::time::Duration::from_micros(interval_us);
             let wait = {
                 let mut s = self.state.lock().await;
                 let now = tokio::time::Instant::now();
-                let refill = now.duration_since(s.last_refill).as_secs_f64()
-                    / self.min_interval.as_secs_f64();
+                let refill = now.duration_since(s.last_refill).as_secs_f64() / interval.as_secs_f64();
                 s.tokens = (s.tokens + refill).min(self.burst);
                 s.last_refill = now;
                 if s.tokens >= 1.0 {
@@ -69,12 +115,72 @@ impl OperatorLimiter {
                     s.tokens -= 1.0;
                     return;
                 }
-                self.min_interval.mul_f64(1.0 - s.tokens)
+                interval.mul_f64(1.0 - s.tokens)
             };
             // Sleep outside the lock so other operators'/watchers' callers
             // aren't serialized behind our wait, then re-check.
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// The operator answered 429: slow down.
+    pub fn on_rate_limited(&self) {
+        self.back_off_at(tokio::time::Instant::now());
+    }
+
+    /// A request went through: speed up again once it has been quiet for a while.
+    pub fn on_success(&self) {
+        self.recover_at(tokio::time::Instant::now());
+    }
+
+    fn back_off_at(&self, now: tokio::time::Instant) {
+        if self.floor_us == self.ceiling_us {
+            return;
+        }
+        let mut adapt = self.adapt.lock();
+        let current = self.interval_us.load(Ordering::Relaxed);
+        let window = BACKOFF_WINDOW.max(std::time::Duration::from_micros(current));
+        if adapt.last_backoff.is_some_and(|t| now.duration_since(t) < window) {
+            return;
+        }
+        adapt.last_backoff = Some(now);
+        self.publish(current.saturating_mul(2).min(self.ceiling_us));
+    }
+
+    fn recover_at(&self, now: tokio::time::Instant) {
+        let current = self.interval_us.load(Ordering::Relaxed);
+        if current <= self.floor_us {
+            return;
+        }
+        let mut adapt = self.adapt.lock();
+        let quiet = adapt.last_backoff.is_none_or(|t| now.duration_since(t) >= RECOVERY_QUIET);
+        let due = adapt.last_step.is_none_or(|t| now.duration_since(t) >= RECOVERY_STEP);
+        if quiet && due {
+            adapt.last_step = Some(now);
+            self.publish((current - current / 10).max(self.floor_us));
+        }
+    }
+
+    fn publish(&self, interval_us: u64) {
+        self.interval_us.store(interval_us, Ordering::Relaxed);
+        if !self.name.is_empty() {
+            metrics::gauge!("certstream_operator_request_interval_ms", "operator" => self.name.clone())
+                .set(interval_us as f64 / 1000.0);
+        }
+    }
+}
+
+/// Tells the operator's limiter what a request got back; a watcher without a
+/// limiter (a log configured by hand) has nothing to tell.
+pub(crate) fn note_rate_limited(limiter: &Option<OperatorRateLimiter>) {
+    if let Some(limiter) = limiter {
+        limiter.on_rate_limited();
+    }
+}
+
+pub(crate) fn note_success(limiter: &Option<OperatorRateLimiter>) {
+    if let Some(limiter) = limiter {
+        limiter.on_success();
     }
 }
 
@@ -414,6 +520,75 @@ mod broadcast_tests {
         // And drain so we don't deadlock the channel.
         let _ = _rx;
         let _wall_time = Instant::now();
+    }
+
+    fn adaptive(floor_ms: u64) -> OperatorLimiter {
+        OperatorLimiter::adaptive(String::new(), std::time::Duration::from_millis(floor_ms), 1)
+    }
+
+    fn interval_ms(l: &OperatorLimiter) -> u64 {
+        l.interval_us.load(Ordering::Relaxed) / 1000
+    }
+
+    #[test]
+    fn a_429_doubles_the_interval_once_per_window() {
+        let l = adaptive(50);
+        let t0 = tokio::time::Instant::now();
+        assert_eq!(interval_ms(&l), 50);
+
+        l.back_off_at(t0);
+        assert_eq!(interval_ms(&l), 100);
+        // Requests already in flight answer 429 too: one signal, not three.
+        l.back_off_at(t0 + std::time::Duration::from_millis(200));
+        l.back_off_at(t0 + std::time::Duration::from_millis(900));
+        assert_eq!(interval_ms(&l), 100);
+
+        l.back_off_at(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(interval_ms(&l), 200);
+    }
+
+    #[test]
+    fn the_interval_stops_at_the_ceiling() {
+        let l = adaptive(500);
+        let mut t = tokio::time::Instant::now();
+        for _ in 0..10 {
+            l.back_off_at(t);
+            t += std::time::Duration::from_secs(10);
+        }
+        assert_eq!(l.interval_us.load(Ordering::Relaxed), SLOWEST_INTERVAL.as_micros() as u64);
+    }
+
+    #[test]
+    fn the_interval_comes_back_down_after_a_quiet_stretch_and_stops_at_the_floor() {
+        let l = adaptive(100);
+        let t0 = tokio::time::Instant::now();
+        l.back_off_at(t0);
+        l.back_off_at(t0 + std::time::Duration::from_secs(2));
+        assert_eq!(interval_ms(&l), 400);
+
+        // Not quiet long enough yet.
+        l.recover_at(t0 + std::time::Duration::from_secs(20));
+        assert_eq!(interval_ms(&l), 400);
+
+        // Quiet: a tenth faster each step, no more often than every step.
+        let mut t = t0 + std::time::Duration::from_secs(40);
+        l.recover_at(t);
+        assert_eq!(interval_ms(&l), 360);
+        l.recover_at(t + std::time::Duration::from_secs(3));
+        assert_eq!(interval_ms(&l), 360, "a step is not repeated inside RECOVERY_STEP");
+
+        for _ in 0..60 {
+            t += RECOVERY_STEP;
+            l.recover_at(t);
+        }
+        assert_eq!(interval_ms(&l), 100, "recovery must stop at the floor");
+    }
+
+    #[test]
+    fn a_fixed_limiter_never_adapts() {
+        let l = OperatorLimiter::with_burst(std::time::Duration::from_millis(200), 1);
+        l.back_off_at(tokio::time::Instant::now());
+        assert_eq!(interval_ms(&l), 200);
     }
 
     /// Burst semantics: a bucket of N allows N immediate ticks, then the

@@ -122,6 +122,9 @@ impl HttpTileReader {
             let status = resp.status();
             if !status.is_success() {
                 debug!(%url, %status, "hash tile request rejected");
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    crate::ct::note_rate_limited(&limiter);
+                }
                 return if status == reqwest::StatusCode::NOT_FOUND {
                     Fetched::NotFound
                 } else {

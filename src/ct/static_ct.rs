@@ -1154,6 +1154,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 Ok(size) => full_tile_floor(size),
                 Err(SthError::RateLimited(retry_after_ms)) => {
                     health.record_rate_limit_with_ms(config.unhealthy_threshold, retry_after_ms);
+                    super::note_rate_limited(&rate_limiter);
                     metrics::counter!(
                         "certstream_ct_log_rate_limited_total",
                         "log" => log_name.clone(),
@@ -1184,6 +1185,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             super::normalize::parse_retry_after(resp.headers(), &log.description);
                         health
                             .record_rate_limit_with_ms(config.unhealthy_threshold, retry_after_ms);
+                        super::note_rate_limited(&rate_limiter);
                         metrics::counter!(
                             "certstream_ct_log_rate_limited_total",
                             "log" => log_name.clone(),
@@ -1416,7 +1418,10 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 let is_last_tile = tile_index == end_tile;
 
                 let raw_data = match outcome {
-                    super::FetchOutcome::Body(b) => b,
+                    super::FetchOutcome::Body(b) => {
+                        super::note_success(&rate_limiter);
+                        b
+                    }
                     super::FetchOutcome::Http(status, retry_after) => {
                         if serves_names_tiles.is_none() && status.as_u16() == 404 {
                             info!(
@@ -1431,6 +1436,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                                 config.unhealthy_threshold,
                                 retry_after_ms,
                             );
+                            super::note_rate_limited(&rate_limiter);
                             metrics::counter!(
                                 "certstream_ct_log_rate_limited_total",
                                 "log" => log_name.clone(),

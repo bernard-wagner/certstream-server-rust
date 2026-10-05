@@ -1178,7 +1178,8 @@ fn spawn_pool(
                 .unwrap_or(ctx.config.default_operator_rate_limit_ms);
             // Burst = fetch_concurrency so a watcher can pipeline its
             // catch-up fetches; sustained rate stays 1 per `ms`.
-            Arc::new(ct::OperatorLimiter::with_burst(
+            Arc::new(ct::OperatorLimiter::adaptive(
+                op.clone(),
                 Duration::from_millis(ms),
                 ctx.config.fetch_concurrency,
             ))

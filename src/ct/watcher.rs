@@ -468,6 +468,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                             super::normalize::parse_retry_after(resp.headers(), &log.description);
                         health
                             .record_rate_limit_with_ms(config.unhealthy_threshold, retry_after_ms);
+                        super::note_rate_limited(&rate_limiter);
                         metrics::counter!(
                             "certstream_ct_log_rate_limited_total",
                             "log" => log_name.clone(),
@@ -607,13 +608,17 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                 debug_assert_eq!(batch_start, current_index);
 
                 let body = match outcome {
-                    super::FetchOutcome::Body(b) => b,
+                    super::FetchOutcome::Body(b) => {
+                        super::note_success(&rate_limiter);
+                        b
+                    }
                     super::FetchOutcome::Http(status, retry_after) => {
                         if let Some(retry_after_ms) = retry_after {
                             health.record_rate_limit_with_ms(
                                 config.unhealthy_threshold,
                                 retry_after_ms,
                             );
+                            super::note_rate_limited(&rate_limiter);
                             metrics::counter!(
                                 "certstream_ct_log_rate_limited_total",
                                 "log" => log_name.clone(),
