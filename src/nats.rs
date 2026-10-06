@@ -192,6 +192,7 @@ fn sample_queue(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
