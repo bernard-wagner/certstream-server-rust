@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 env:
-  DOCKER_IMAGE: ghcr.io/reloading01/certstream-server-rust
+  DOCKER_IMAGE: ghcr.io/${{ github.repository }}
   DOCKERHUB_IMAGE: reloading01/certstream-server-rust
 
 # Pushing twice in quick succession used to leave two multi-platform image
@@ -90,9 +90,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
+        if: github.repository == 'reloading01/certstream-server-rust'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -104,10 +105,11 @@ jobs:
         with:
           images: |
             ${{ env.DOCKER_IMAGE }}
-            ${{ env.DOCKERHUB_IMAGE }}
+            name=${{ env.DOCKERHUB_IMAGE }},enable=${{ github.repository == 'reloading01/certstream-server-rust' }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
+            type=sha,format=long
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -123,7 +125,7 @@ jobs:
       # The Docker Hub page shows the README and a one line summary. Cosmetic, so
       # a token without the right to edit the repository must not fail a release.
       - name: Update the Docker Hub description
-        if: github.ref == 'refs/heads/main'
+        if: github.repository == 'reloading01/certstream-server-rust' && github.ref == 'refs/heads/main'
         continue-on-error: true
         uses: peter-evans/dockerhub-description@v5
         with:
@@ -289,7 +291,7 @@ jobs:
   # skips rather than failing the release.
   homebrew:
     needs: binaries
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'reloading01/certstream-server-rust' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -349,7 +351,7 @@ jobs:
   # HOMEBREW_TAP_TOKEN, reused here for write access to the packages repo.
   repository:
     needs: packages
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.repository == 'reloading01/certstream-server-rust' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Check for signing key
