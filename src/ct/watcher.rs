@@ -246,7 +246,6 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
     } = ctx;
     use backon::{ExponentialBuilder, Retryable};
     use serde::Deserialize;
-    use tokio::time::sleep;
 
     #[derive(Debug, Deserialize)]
     struct SthResponse {
@@ -267,6 +266,11 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
     let base_url = log.normalized_url();
     let log_name = log.description.clone();
     let source_id = super::normalize::source_id(log.log_id.as_deref(), &base_url);
+    let diagnostics = crate::telemetry::WatcherMetrics::new(
+        &log.operator, &log_name, &source_id, "rfc6962",
+    );
+    let head_http = diagnostics.http("get_sth");
+    let entries_http = diagnostics.http("get_entries");
     let log_id_label = log.log_id.clone().unwrap_or_default();
     let nats_subject = nats.as_ref().map(|_| {
         format!(
@@ -376,19 +380,21 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             .with_min_delay(Duration::from_millis(config.retry_initial_delay_ms))
             .with_max_delay(Duration::from_millis(config.retry_max_delay_ms))
             .with_max_times(config.retry_max_attempts as usize);
+        let retry_diagnostics = diagnostics.clone();
 
         match (|| async {
-            let response: SthResponse = client
-                .get(&sth_url)
-                .timeout(timeout)
-                .send()
+            let response: SthResponse = head_http
+                .send(client.get(&sth_url).timeout(timeout))
                 .await?
                 .json()
                 .await?;
             Ok::<_, reqwest::Error>(response.tree_size)
         })
         .retry(backoff)
-        .sleep(tokio::time::sleep)
+        .sleep(move |duration| {
+            let diagnostics = retry_diagnostics.clone();
+            async move { diagnostics.sleep("initial_retry", duration).await }
+        })
         .await
         {
             Ok(size) => {
@@ -405,6 +411,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
         }
     };
 
+    diagnostics.position(current_index);
     // The durable output's acknowledged position starts where this watcher
     // does, so the contiguous prefix has something to grow from.
     if let Some(sink) = &nats {
@@ -419,7 +426,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
 
         if !health.should_attempt() {
             debug!(log = %log.description, "circuit breaker open, waiting");
-            sleep(Duration::from_secs(config.health_check_interval_secs)).await;
+            diagnostics.sleep("circuit_open", Duration::from_secs(config.health_check_interval_secs)).await;
             continue;
         }
 
@@ -428,14 +435,14 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             // certstream_log_health_checks_failed counter; the per-iteration log
             // line only adds value to live debugging, so emit at debug.
             debug!(log = %log.description, errors = health.total_errors(), "log is unhealthy, waiting for recovery check");
-            sleep(Duration::from_secs(config.health_check_interval_secs)).await;
+            diagnostics.sleep("unhealthy", Duration::from_secs(config.health_check_interval_secs)).await;
 
             // The status has to be inspected, not just the transport result:
             // treating a 5xx or 429 as healthy sends the watcher straight back
             // into the get-entries loop, which fails again, and the log
             // oscillates between healthy and unhealthy without ever backing
             // off.
-            match client.get(&sth_url).timeout(timeout).send().await {
+            match head_http.send(client.get(&sth_url).timeout(timeout)).await {
                 Ok(resp) if resp.status().is_success() => {
                     health.record_success(config.healthy_threshold);
                     info!(log = %log.description, "health check passed, resuming");
@@ -459,7 +466,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             }
         }
 
-        let tree_size = match client.get(&sth_url).timeout(timeout).send().await {
+        let tree_size = match head_http.send(client.get(&sth_url).timeout(timeout)).await {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     let status = resp.status();
@@ -481,7 +488,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                         health.record_failure(config.unhealthy_threshold);
                         debug!(log = %log.description, status = %status, "get-sth returned error");
                     }
-                    sleep(health.get_backoff()).await;
+                    diagnostics.sleep("backoff", health.get_backoff()).await;
                     continue;
                 }
                 match resp.json::<SthResponse>().await {
@@ -489,7 +496,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                     Err(e) => {
                         health.record_failure(config.unhealthy_threshold);
                         debug!(log = %log.description, error = %e, "failed to parse tree size");
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         continue;
                     }
                 }
@@ -497,10 +504,11 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             Err(e) => {
                 health.record_failure(config.unhealthy_threshold);
                 debug!(log = %log.description, error = %e, "failed to get tree size");
-                sleep(health.get_backoff()).await;
+                diagnostics.sleep("backoff", health.get_backoff()).await;
                 continue;
             }
         };
+        diagnostics.head(tree_size);
 
         // RFC6962 rollback guard (parity with static_ct). Logged at debug —
         // some replicas flap between adjacent tree_size values, and the
@@ -520,7 +528,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             )
             .increment(1);
             health.record_failure(config.unhealthy_threshold);
-            sleep(health.get_backoff()).await;
+            diagnostics.sleep("backoff", health.get_backoff()).await;
             continue;
         }
         high_water_tree_size = tree_size;
@@ -536,7 +544,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
             if json_buf.capacity() > JSON_BUF_RETAIN_MAX {
                 json_buf = Vec::new();
             }
-            sleep(poll_interval).await;
+            diagnostics.sleep("poll", poll_interval).await;
             continue;
         }
 
@@ -571,35 +579,25 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                 let client = client.clone();
                 let limiter = rate_limiter.clone();
                 let desc = log.description.clone();
+                let diagnostics = diagnostics.clone();
+                let http = entries_http.clone();
                 let url = format!("{}/ct/v1/get-entries?start={}&end={}", base_url, start, end);
                 async move {
                     // Respect per-operator rate limit before making request
                     if let Some(ref l) = limiter {
+                        let _timer = diagnostics.stage("limiter");
                         l.tick().await;
                     }
-                    let outcome = match client.get(&url).timeout(timeout).send().await {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            if status.is_success() {
-                                match resp.bytes().await {
-                                    Ok(b) => super::FetchOutcome::Body(b),
-                                    Err(e) => super::FetchOutcome::Net(e.to_string()),
-                                }
-                            } else {
-                                let retry_after_ms = (status.as_u16() == 429).then(|| {
-                                    super::normalize::parse_retry_after(resp.headers(), &desc)
-                                });
-                                super::FetchOutcome::Http(status, retry_after_ms)
-                            }
-                        }
-                        Err(e) => super::FetchOutcome::Net(e.to_string()),
-                    };
+                    let outcome = http.fetch(client.get(&url).timeout(timeout), &desc).await;
                     (start, end, outcome)
                 }
             })
             .buffered(fetch_concurrency);
 
-            while let Some((batch_start, end, outcome)) = in_flight.next().await {
+            while let Some((batch_start, end, outcome)) = {
+                let _timer = diagnostics.stage("fetch_next");
+                in_flight.next().await
+            } {
                 if shutdown.is_cancelled() {
                     break 'drain;
                 }
@@ -632,19 +630,20 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                             debug!(log = %log.description, start = batch_start, end = end,
                                 "entries not available (400), skipping to tree head");
                             current_index = tree_size;
-                            sleep(poll_interval).await;
+                            diagnostics.position(current_index);
+                            diagnostics.sleep("poll", poll_interval).await;
                             break 'drain;
                         } else {
                             health.record_failure(config.unhealthy_threshold);
                             debug!(log = %log.description, status = %status, "CT log returned error");
                         }
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         break 'drain;
                     }
                     super::FetchOutcome::Net(e) => {
                         health.record_failure(config.unhealthy_threshold);
                         debug!(log = %log.description, error = %e, "failed to fetch entries");
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         break 'drain;
                     }
                 };
@@ -655,6 +654,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                 // so we copy into the per-watcher reusable Vec (processing is
                 // sequential even though fetching is pipelined, so one buffer
                 // still suffices).
+                let decode_timer = diagnostics.stage("decode");
                 #[cfg(feature = "simd")]
                 let parse_result: Result<EntriesResponse, String> = {
                     json_buf.clear();
@@ -665,11 +665,13 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                 #[cfg(not(feature = "simd"))]
                 let parse_result: Result<EntriesResponse, String> =
                     serde_json::from_slice::<EntriesResponse>(&body).map_err(|e| e.to_string());
+                drop(decode_timer);
 
                 match parse_result {
                     Ok(entries_resp) => {
                         health.record_success(config.healthy_threshold);
                         let count = entries_resp.entries.len();
+                        entries_http.returned(count as u64);
 
                         // M-2 fix: an empty response must not advance the index —
                         // that would permanently skip one entry per occurrence.
@@ -685,7 +687,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                             )
                             .increment(1);
                             debug!(log = %log_name, "CT log returned empty entries response, retrying");
-                            sleep(poll_interval).await;
+                            diagnostics.sleep("poll", poll_interval).await;
                             break 'drain;
                         }
 
@@ -716,7 +718,11 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                         let job_tracker = Arc::clone(&tracker);
                         let job_health = Arc::clone(&health);
                         let full_stream_enabled = streams.full;
+                        let job_diagnostics = diagnostics.clone();
+                        let blocking_wait = diagnostics.stage("blocking_queue");
                         let join = tokio::task::spawn_blocking(move || {
+                            drop(blocking_wait);
+                            let _timer = job_diagnostics.stage("process");
                             let mut max_index_seen = batch_start;
                             let mut newest_submission = 0.0f64;
                             let mut durable: Vec<crate::nats::Record> = Vec::new();
@@ -829,6 +835,8 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                             );
 
                             let next_index = max_index_seen + 1;
+                            job_diagnostics.processed(next_index - batch_start);
+                            job_diagnostics.position(next_index);
                             job_state_manager.update_index(&job_base_url, next_index, tree_size);
                             job_tracker.update(
                                 &job_base_url,
@@ -852,6 +860,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                         // window: under `on_full: block` this is where ingest
                         // slows to match durable storage.
                         if let Some(sink) = &nats {
+                            let _timer = diagnostics.stage("nats_enqueue");
                             let log_key: Arc<str> = Arc::from(base_url.as_str());
                             for index in skipped {
                                 sink.acks.record_skipped(&log_key, index);
@@ -889,7 +898,7 @@ pub async fn run_watcher_with_cache(log: CtLog, ctx: WatcherContext) {
                     Err(ref e) => {
                         health.record_failure(config.unhealthy_threshold);
                         debug!(log = %log.description, error = %e, "failed to parse entries");
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         break 'drain;
                     }
                 }

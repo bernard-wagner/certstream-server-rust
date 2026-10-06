@@ -290,6 +290,7 @@ async fn check_tree_consistency(
     cp: &Checkpoint,
     log_name: &str,
     source_id: &str,
+    diagnostics: &crate::telemetry::WatcherMetrics,
 ) -> Result<(), String> {
     let new_root = crate::ct::merkle::parse_root_hash(&cp.root_hash)?;
     let new_size = cp.tree_size;
@@ -319,7 +320,11 @@ async fn check_tree_consistency(
     }
 
     let reader = Arc::clone(reader);
+    let job_diagnostics = diagnostics.clone();
+    let blocking_wait = diagnostics.stage("blocking_queue");
     let verdict = tokio::task::spawn_blocking(move || {
+        drop(blocking_wait);
+        let _timer = job_diagnostics.stage("verification");
         crate::ct::merkle::verify_consistency(&reader, old_size, old_root, new_size, new_root)
     })
     .await
@@ -698,16 +703,15 @@ async fn fetch_sth_tree_size(
     sth_url: &str,
     timeout: Duration,
     log_desc: &str,
+    http: &crate::telemetry::HttpMetrics,
 ) -> Result<u64, SthError> {
     #[derive(serde::Deserialize)]
     struct SthResponse {
         tree_size: u64,
     }
 
-    let resp = client
-        .get(sth_url)
-        .timeout(timeout)
-        .send()
+    let resp = http
+        .send(client.get(sth_url).timeout(timeout))
         .await
         .map_err(|e| SthError::Other(e.to_string()))?;
 
@@ -868,7 +872,6 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
         streams,
         issuer_cache: shared_issuer_cache,
     } = ctx;
-    use tokio::time::sleep;
 
     let base_url = log.normalized_url();
     // Use the explicit `log_origin` from config when the fetch URL (e.g. mon.*) differs from
@@ -882,6 +885,15 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
     });
     let log_name = log.description.clone();
     let source_id = super::normalize::source_id(log.log_id.as_deref(), &base_url);
+    let diagnostics = crate::telemetry::WatcherMetrics::new(
+        &log.operator, &log_name, &source_id, "static_ct",
+    );
+    let head_http = diagnostics.http("get_sth");
+    let checkpoint_http = diagnostics.http("checkpoint");
+    let full_http = diagnostics.http("tile_full");
+    let partial_http = diagnostics.http("tile_partial");
+    let names_full_http = diagnostics.http("names_full");
+    let names_partial_http = diagnostics.http("names_partial");
     let log_id_label = log.log_id.clone().unwrap_or_default();
     let source = Arc::new(Source {
         name: Arc::from(log.description.as_str()),
@@ -1042,24 +1054,27 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
         let initial = loop {
             attempt += 1;
             let outcome: Result<u64, String> = if tree_size_source == TreeSizeSource::GetSth {
-                fetch_sth_tree_size(&client, &sth_url, timeout, &log.description)
+                fetch_sth_tree_size(&client, &sth_url, timeout, &log.description, &head_http)
                     .await
                     .map_err(|e| e.to_string())
             } else {
-                match client.get(&checkpoint_url).timeout(timeout).send().await {
+                match checkpoint_http.send(client.get(&checkpoint_url).timeout(timeout)).await {
                     Ok(resp) if !resp.status().is_success() => Err(format!("HTTP {}", resp.status())),
                     Ok(resp) => match resp.text().await {
                         Ok(text) => match parse_checkpoint(&text, &expected_origin) {
                             Some(cp) => {
-                                let sig = accept_checkpoint_signature(
-                                    &text,
-                                    &expected_origin,
-                                    log.key.as_deref(),
-                                    config.checkpoint_signature_mode,
-                                    &log.description,
-                                    &log_name,
-                                    &source_id,
-                                );
+                                let sig = {
+                                    let _timer = diagnostics.stage("verification");
+                                    accept_checkpoint_signature(
+                                        &text,
+                                        &expected_origin,
+                                        log.key.as_deref(),
+                                        config.checkpoint_signature_mode,
+                                        &log.description,
+                                        &log_name,
+                                        &source_id,
+                                    )
+                                };
                                 verification.checkpoint_signature = sig.state;
                                 if sig.accepted {
                                     Ok(cp.tree_size)
@@ -1095,7 +1110,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         error = %reason,
                         "initial checkpoint fetch failed, retrying"
                     );
-                    sleep(Duration::from_millis(delay_ms)).await;
+                    diagnostics.sleep("initial_retry", Duration::from_millis(delay_ms)).await;
                     delay_ms = (delay_ms * 2).min(max_delay_ms);
                 }
             }
@@ -1117,6 +1132,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
         start
     };
 
+    diagnostics.position(current_index);
     // The durable output's acknowledged position starts where this watcher
     // does, so the contiguous prefix has something to grow from.
     if let Some(sink) = &nats {
@@ -1131,7 +1147,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
 
         if !health.should_attempt() {
             debug!(log = %log.description, "circuit breaker open, waiting (static CT)");
-            sleep(Duration::from_secs(config.health_check_interval_secs)).await;
+            diagnostics.sleep("circuit_open", Duration::from_secs(config.health_check_interval_secs)).await;
             continue;
         }
 
@@ -1143,14 +1159,14 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
             // Status surfaced via /health/deep + the certstream_log_health_*
             // counters; the per-iteration log line is debug-only.
             debug!(log = %log.description, errors = health.total_errors(), "static CT log is unhealthy, waiting for recovery");
-            sleep(Duration::from_secs(config.health_check_interval_secs)).await;
+            diagnostics.sleep("unhealthy", Duration::from_secs(config.health_check_interval_secs)).await;
         }
 
         // Named `raw` because the monotonicity guard below wants the head as
         // reported; on the get-sth path it is already floored to a full tile,
         // which is monotonic all the same.
         let raw_tree_size = if tree_size_source == TreeSizeSource::GetSth {
-            match fetch_sth_tree_size(&client, &sth_url, timeout, &log.description).await {
+            match fetch_sth_tree_size(&client, &sth_url, timeout, &log.description, &head_http).await {
                 Ok(size) => full_tile_floor(size),
                 Err(SthError::RateLimited(retry_after_ms)) => {
                     health.record_rate_limit_with_ms(config.unhealthy_threshold, retry_after_ms);
@@ -1163,7 +1179,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     )
                     .increment(1);
                     debug!(log = %log.description, retry_after_ms, "rate limited on get-sth, backing off");
-                    sleep(health.get_backoff()).await;
+                    diagnostics.sleep("backoff", health.get_backoff()).await;
                     continue;
                 }
                 Err(SthError::Other(e)) => {
@@ -1172,12 +1188,12 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     }
                     health.record_failure(config.unhealthy_threshold);
                     debug!(log = %log.description, error = %e, "failed to fetch get-sth head");
-                    sleep(health.get_backoff()).await;
+                    diagnostics.sleep("backoff", health.get_backoff()).await;
                     continue;
                 }
             }
         } else {
-            match client.get(&checkpoint_url).timeout(timeout).send().await {
+            match checkpoint_http.send(client.get(&checkpoint_url).timeout(timeout)).await {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.as_u16() == 429 {
@@ -1195,7 +1211,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         .increment(1);
                         debug!(log = %log.description, retry_after_ms, "rate limited on checkpoint fetch, backing off");
                         counter_checkpoint_errors.increment(1);
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         continue;
                     }
                     if !status.is_success() {
@@ -1205,26 +1221,29 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         health.record_failure(config.unhealthy_threshold);
                         debug!(log = %log.description, %status, "checkpoint fetch returned non-success");
                         counter_checkpoint_errors.increment(1);
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         continue;
                     }
                     match resp.text().await {
                         Ok(text) => match parse_checkpoint(&text, &expected_origin) {
                             Some(cp) => {
-                                let sig = accept_checkpoint_signature(
-                                    &text,
-                                    &expected_origin,
-                                    log.key.as_deref(),
-                                    config.checkpoint_signature_mode,
-                                    &log.description,
-                                    &log_name,
-                                    &source_id,
-                                );
+                                let sig = {
+                                    let _timer = diagnostics.stage("verification");
+                                    accept_checkpoint_signature(
+                                        &text,
+                                        &expected_origin,
+                                        log.key.as_deref(),
+                                        config.checkpoint_signature_mode,
+                                        &log.description,
+                                        &log_name,
+                                        &source_id,
+                                    )
+                                };
                                 verification.checkpoint_signature = sig.state;
                                 if !sig.accepted {
                                     health.record_failure(config.unhealthy_threshold);
                                     counter_checkpoint_errors.increment(1);
-                                    sleep(health.get_backoff()).await;
+                                    diagnostics.sleep("backoff", health.get_backoff()).await;
                                     continue;
                                 }
 
@@ -1235,6 +1254,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                                         &cp,
                                         &log_name,
                                         &source_id,
+                                        &diagnostics,
                                     )
                                     .await
                                     {
@@ -1249,7 +1269,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                                                 "consistency verification failed; skipping this checkpoint"
                                             );
                                             health.record_failure(config.unhealthy_threshold);
-                                            sleep(health.get_backoff()).await;
+                                            diagnostics.sleep("backoff", health.get_backoff()).await;
                                             continue;
                                         }
                                     }
@@ -1266,7 +1286,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                                 health.record_failure(config.unhealthy_threshold);
                                 debug!(log = %log.description, "failed to parse checkpoint");
                                 counter_checkpoint_errors.increment(1);
-                                sleep(health.get_backoff()).await;
+                                diagnostics.sleep("backoff", health.get_backoff()).await;
                                 continue;
                             }
                         },
@@ -1274,7 +1294,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             health.record_failure(config.unhealthy_threshold);
                             debug!(log = %log.description, error = %e, "failed to read checkpoint");
                             counter_checkpoint_errors.increment(1);
-                            sleep(health.get_backoff()).await;
+                            diagnostics.sleep("backoff", health.get_backoff()).await;
                             continue;
                         }
                     }
@@ -1286,12 +1306,13 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     health.record_failure(config.unhealthy_threshold);
                     debug!(log = %log.description, error = %e, "failed to fetch checkpoint");
                     counter_checkpoint_errors.increment(1);
-                    sleep(health.get_backoff()).await;
+                    diagnostics.sleep("backoff", health.get_backoff()).await;
                     continue;
                 }
             }
         };
 
+        diagnostics.head(raw_tree_size);
         // Tree-size monotonicity check: a static-CT log's tree_size never
         // shrinks. A regression indicates an operator bug, an incomplete
         // checkpoint replica, or a partial deployment — back off and retry
@@ -1318,11 +1339,11 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
             // Hold position and re-poll instead; the guard still does its real
             // job of never reading tiles the log has not published.
             if tree_size_source == TreeSizeSource::GetSth {
-                sleep(poll_interval).await;
+                diagnostics.sleep("poll", poll_interval).await;
                 continue;
             }
             health.record_failure(config.unhealthy_threshold);
-            sleep(health.get_backoff()).await;
+            diagnostics.sleep("backoff", health.get_backoff()).await;
             continue;
         }
         high_water_tree_size = raw_tree_size;
@@ -1338,7 +1359,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 tree_size,
                 health.total_errors(),
             );
-            sleep(poll_interval).await;
+            diagnostics.sleep("poll", poll_interval).await;
             continue;
         }
 
@@ -1379,6 +1400,13 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 let client = client.clone();
                 let limiter = rate_limiter.clone();
                 let desc = log.description.clone();
+                let diagnostics = diagnostics.clone();
+                let http = match (want_names, partial_width > 0) {
+                    (false, false) => &full_http,
+                    (false, true) => &partial_http,
+                    (true, false) => &names_full_http,
+                    (true, true) => &names_partial_http,
+                }.clone();
                 let url = if want_names {
                     crate::ct::names_tiles::names_tile_url(&base_url, tile_index, partial_width)
                 } else {
@@ -1387,35 +1415,29 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 async move {
                     // Respect per-operator rate limit before making request
                     if let Some(ref l) = limiter {
+                        let _timer = diagnostics.stage("limiter");
                         l.tick().await;
                     }
-                    let outcome = match client.get(&url).timeout(timeout).send().await {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            if status.is_success() {
-                                match resp.bytes().await {
-                                    Ok(b) => super::FetchOutcome::Body(b),
-                                    Err(e) => super::FetchOutcome::Net(e.to_string()),
-                                }
-                            } else {
-                                let retry_after_ms = (status.as_u16() == 429).then(|| {
-                                    super::normalize::parse_retry_after(resp.headers(), &desc)
-                                });
-                                super::FetchOutcome::Http(status, retry_after_ms)
-                            }
-                        }
-                        Err(e) => super::FetchOutcome::Net(e.to_string()),
-                    };
+                    let outcome = http.fetch(client.get(&url).timeout(timeout), &desc).await;
                     (tile_index, entries_in_tile, url, outcome)
                 }
             })
             .buffered(fetch_concurrency);
 
-            while let Some((tile_index, entries_in_tile, url, outcome)) = in_flight.next().await {
+            while let Some((tile_index, entries_in_tile, url, outcome)) = {
+                let _timer = diagnostics.stage("fetch_next");
+                in_flight.next().await
+            } {
                 if shutdown.is_cancelled() {
                     break 'tile_loop;
                 }
                 let is_last_tile = tile_index == end_tile;
+                let response_http = match (want_names, is_last_tile && entries_in_tile < 256) {
+                    (false, false) => &full_http,
+                    (false, true) => &partial_http,
+                    (true, false) => &names_full_http,
+                    (true, true) => &names_partial_http,
+                };
 
                 let raw_data = match outcome {
                     super::FetchOutcome::Body(b) => {
@@ -1449,13 +1471,13 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             health.record_failure(config.unhealthy_threshold);
                             debug!(log = %log.description, url = %url, status = %status, "tile fetch failed");
                         }
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         break 'tile_loop;
                     }
                     super::FetchOutcome::Net(e) => {
                         health.record_failure(config.unhealthy_threshold);
                         debug!(log = %log.description, url = %url, error = %e, "failed to fetch tile");
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         break 'tile_loop;
                     }
                 };
@@ -1471,7 +1493,11 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
 
                     let tile_start_index = tile_index * 256;
                     let skip = current_index.saturating_sub(tile_start_index) as usize;
+                    let job_diagnostics = diagnostics.clone();
+                    let blocking_wait = diagnostics.stage("blocking_queue");
                     let slots = match tokio::task::spawn_blocking(move || {
+                        drop(blocking_wait);
+                        let _timer = job_diagnostics.stage("decode");
                         crate::ct::names_tiles::parse_names_tile(raw_data)
                     })
                     .await
@@ -1480,6 +1506,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
                         Err(_) => break 'tile_loop,
                     };
+                    response_http.returned(slots.len() as u64);
 
                     // A names tile holds one line per entry of the equivalent
                     // data tile. A short tile means a truncated fetch or a
@@ -1494,12 +1521,13 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             "names tile entry count mismatch; skipping"
                         );
                         health.record_failure(config.unhealthy_threshold);
-                        sleep(health.get_backoff()).await;
+                        diagnostics.sleep("backoff", health.get_backoff()).await;
                         break 'tile_loop;
                     }
 
                     // `skip` counts entry slots, so the parser has to keep an
                     // empty slot for every line it could not use.
+                    let process_timer = diagnostics.stage("process");
                     for entry in slots.into_iter().skip(skip).flatten() {
                         if !dedup.is_new(&crate::ct::names_tiles::dedup_key(&entry)) {
                             continue;
@@ -1508,7 +1536,9 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         crate::ct::broadcast_names(&entry, &tx, &stats, &counter_messages);
                     }
 
+                    diagnostics.processed(tile_start_index + entries_in_tile - current_index);
                     current_index = tile_start_index + entries_in_tile;
+                    diagnostics.position(current_index);
                     state_manager.update_index(&base_url, current_index, tree_size);
                     tracker.update(
                         &base_url,
@@ -1517,6 +1547,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         tree_size,
                         health.total_errors(),
                     );
+                    drop(process_timer);
                     continue;
                 }
 
@@ -1524,7 +1555,11 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 // pure CPU with no yield points — run it on the
                 // blocking pool so concurrent catch-up across many
                 // watchers doesn't starve the async runtime.
+                let job_diagnostics = diagnostics.clone();
+                let blocking_wait = diagnostics.stage("blocking_queue");
                 let leaves = match tokio::task::spawn_blocking(move || {
+                    drop(blocking_wait);
+                    let _timer = job_diagnostics.stage("decode");
                     let data: Bytes = match decompress_tile(&raw_data) {
                         // Not gzip (or decode failure): content is
                         // the response body as-is — reuse it.
@@ -1542,6 +1577,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     // Cancelled (runtime shutdown) — bail out quietly.
                     Err(_) => break 'tile_loop,
                 };
+                response_http.returned(leaves.len() as u64);
 
                 // Static-CT-API rc.1: a tile must contain exactly
                 // `entries_in_tile` leaves (256 for full, partial
@@ -1565,7 +1601,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     )
                     .increment(1);
                     health.record_failure(config.unhealthy_threshold);
-                    sleep(health.get_backoff()).await;
+                    diagnostics.sleep("backoff", health.get_backoff()).await;
                     break 'tile_loop;
                 }
 
@@ -1592,7 +1628,11 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             break 'tile_loop;
                         }
                     };
+                    let job_diagnostics = diagnostics.clone();
+                    let blocking_wait = diagnostics.stage("blocking_queue");
                     let verdict = tokio::task::spawn_blocking(move || {
+                        drop(blocking_wait);
+                        let _timer = job_diagnostics.stage("verification");
                         crate::ct::merkle::verify_inclusion(&reader, tree_size, root, &claims)
                     })
                     .await;
@@ -1646,7 +1686,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                             )
                             .increment(1);
                             health.record_failure(config.unhealthy_threshold);
-                            sleep(health.get_backoff()).await;
+                            diagnostics.sleep("backoff", health.get_backoff()).await;
                             break 'tile_loop;
                         }
                     }
@@ -1684,6 +1724,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         .filter(|fp| issuer_cache.get(fp).is_none())
                         .collect();
                     if !unique_fps.is_empty() {
+                        let _timer = diagnostics.stage("issuer_fetch");
                         stream::iter(unique_fps)
                             .for_each_concurrent(MAX_INFLIGHT_ISSUER_FETCHES, |fp| {
                                 let client = client.clone();
@@ -1737,7 +1778,12 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                 let job_nats_subject = nats_subject.clone().unwrap_or_default();
                 let job_log_url: Arc<str> = Arc::from(base_url.as_str());
                 let job_log_key = log_id_for_msgs.clone();
+                let job_diagnostics = diagnostics.clone();
+                let blocking_wait = diagnostics.stage("blocking_queue");
+                let batch_start = current_index;
                 let join = tokio::task::spawn_blocking(move || {
+                    drop(blocking_wait);
+                    let _timer = job_diagnostics.stage("process");
                     let mut newest_submission = 0.0f64;
                     let mut durable: Vec<crate::nats::Record> = Vec::new();
                     let mut skipped: Vec<u64> = Vec::new();
@@ -1880,6 +1926,8 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                     );
 
                     let next_index = ((tile_index + 1) * 256).min(tree_size);
+                    job_diagnostics.processed(next_index - batch_start);
+                    job_diagnostics.position(next_index);
                     job_state_manager.update_index(&job_base_url, next_index, tree_size);
                     job_tracker.update(
                         &job_base_url,
@@ -1896,6 +1944,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
                         // tile: under `on_full: block` this is where ingest
                         // slows down to match durable storage.
                         if let Some(sink) = &nats {
+                            let _timer = diagnostics.stage("nats_enqueue");
                             let log_key: Arc<str> = Arc::from(base_url.as_str());
                             for index in skipped {
                                 sink.acks.record_skipped(&log_key, index);
@@ -1916,7 +1965,7 @@ pub async fn run_static_ct_watcher(log: CtLog, ctx: WatcherContext) {
         }
 
         if current_index >= tree_size {
-            sleep(poll_interval).await;
+            diagnostics.sleep("poll", poll_interval).await;
         }
     }
 }

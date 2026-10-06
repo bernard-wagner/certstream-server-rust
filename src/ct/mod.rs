@@ -9,6 +9,7 @@ pub mod watcher;
 
 pub use log_list::*;
 pub use normalize::normalize_operator;
+pub(crate) use normalize::parse_retry_after;
 pub use parser::*;
 
 use std::sync::Arc;

@@ -364,6 +364,68 @@ A widening gap between the two points to allocator behavior; growth in `allocate
 
 Dedup memory scales with ingest rate and TTL, bounded by `dedup.capacity`. At 420 certs/s, a 15-minute window would require roughly 354K entries, so the default 200K capacity shortens the effective window. `certstream_dedup_effective_ttl_seconds` reports the active window.
 
+## Ingestion diagnostics
+
+The fork exposes additional Prometheus metrics to distinguish local pacing,
+network/serving delays, processing costs and durable-output backpressure.
+CT metrics carry `operator` (canonicalized), `log`, `source_id` and `log_type`.
+Endpoint labels are bounded: `get_sth`, `checkpoint`, `get_entries`,
+`tile_full`, `tile_partial`, `names_full`, and `names_partial`.
+No certificate hashes, entry indexes or request URLs become labels.
+
+| Metric | Meaning |
+| --- | --- |
+| `certstream_ct_http_seconds` | Histogram by `endpoint` and `phase=headers/body`; starts after local pacing. Headers include DNS, connection, TLS and server response time. Body includes automatic decompression; get-sth JSON also includes decoding. |
+| `certstream_ct_http_requests_total` | Counter by endpoint and HTTP `status`, or `timeout` / `transport_error` before headers. Cancelled requests have timing samples but no completed-request count. |
+| `certstream_ct_http_body_errors_total` | Failed body reads, by `reason=timeout/decode/transport_error`. |
+| `certstream_ct_response_body_bytes_total` | Successfully read, decoded byte/text bodies, not compressed wire bytes; tiny get-sth JSON bodies are excluded. |
+| `certstream_ct_entries_returned_total` | Entries decoded from fetched responses, including replayed prefixes; abandoned prefetches that are never decoded are excluded. |
+| `certstream_ct_entries_processed_total` | Entries advanced, including unparseable entries, excluding replayed prefixes and independent of cross-log live dedup; counted before durable ACK. |
+| `certstream_ct_head_entries` / `certstream_ct_read_position` | Observed tree size and processed next-entry index. Read position is **not** the safe-to-persist acknowledged position. |
+| `certstream_ct_stage_seconds` | Histogram by stage: `limiter`, `fetch_next`, `blocking_queue`, `decode`, `verification`, `issuer_fetch`, `process`, `nats_enqueue`. CPU processing excludes NATS enqueue waits. Verification includes any proof-tile fetching. |
+| `certstream_ct_wait_seconds` | Actual sleep by `reason=poll/backoff/unhealthy/circuit_open/initial_retry`, including interrupted sleeps, rather than the requested sleep duration. |
+| `certstream_nats_queue_depth` / `certstream_nats_queue_capacity` | Shared publisher queue usage, sampled every 250 ms independently of ACK progress; reserved slots may be included. |
+| `certstream_nats_enqueue_seconds` | Time waiting for publisher queue space; measured per record. CT's `stage=nats_enqueue` measures the whole enqueue batch per log. |
+| `certstream_nats_queue_residence_seconds` | Time from successful enqueue to dequeue, excluding enqueue wait. |
+| `certstream_nats_publish_seconds` | Complete publish-attempt duration, including send and durable ACK, excluding retry sleep. |
+| `certstream_nats_send_seconds` / `certstream_nats_ack_seconds` | Separate NATS client submission and JetStream ACK waits. |
+| `certstream_nats_retry_wait_seconds` | Actual publisher retry sleep, including interruption. |
+
+Timing metrics export histogram `_bucket`, `_sum` and `_count` series. Companion
+`certstream_ct_http_active`, `certstream_ct_stage_active`, `certstream_ct_wait_active`
+and NATS `*_active` gauges show work that is still in progress. Cancellation and
+errors release these gauges and record the elapsed time. A stopped or aborted
+process cannot report a final sample.
+
+Example queries:
+
+```promql
+# Seconds spent waiting for local pacing, per operator, per second.
+sum by (operator) (rate(certstream_ct_stage_seconds_sum{stage="limiter"}[5m]))
+
+# Response-body p95, separated by log and endpoint.
+histogram_quantile(0.95, sum by (le, log, endpoint) (
+  rate(certstream_ct_http_seconds_bucket{phase="body"}[5m])))
+
+# New entries processed per second, without live-certificate dedup hiding work.
+sum by (operator) (rate(certstream_ct_entries_processed_total[5m]))
+
+# Shared durable publisher's average complete attempt duration.
+rate(certstream_nats_publish_seconds_sum[5m])
+  / rate(certstream_nats_publish_seconds_count[5m])
+```
+
+Interpret HTTP timings alongside `fetch_next` and NATS queue/enqueue metrics:
+elapsed HTTP time can include runtime scheduling and pauses in the buffered
+fetch pipeline, so it is **not** a pure server-latency measurement. These HTTP
+metrics cover primary head/data fetching, not auxiliary issuer/hash-tile requests;
+auxiliary work appears in `issuer_fetch` / `verification` stage timings.
+Stages can overlap across concurrent fetches and watchers: summed seconds per
+second can exceed one and must not be treated as percentages of one CPU.
+Existing lag, ingest-delay, 429, publish-success and publish-failure metrics remain
+unchanged. Fetch concurrency, pacing, retry policy and durable ACK ordering are
+not changed by this instrumentation.
+
 ## Performance
 
 Measured against v1.5.2 on the same host with the default configuration, 100 concurrent WebSocket clients on the lite stream, and a 10-minute plateau window:

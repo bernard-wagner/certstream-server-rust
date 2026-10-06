@@ -843,6 +843,25 @@ docker compose up -d</pre>
                         <tr><td><code>certstream_issuer_fetch_attempts</code></td><td>counter</td><td>Issuers retrieved over the network, which a cache miss does not always cause</td></tr>
                     </tbody>
                 </table>
+                <h3>Ingestion diagnostics (fork)</h3>
+                <p>Additional timings distinguish local pacing, HTTP waits, processing, and durable-output backpressure. CT labels include canonical <code>operator</code>, <code>log</code>, <code>source_id</code>, and <code>log_type</code>; no certificate hashes, indexes, or request URLs become labels.</p>
+                <table class="endpoints-table">
+                    <thead><tr><th>Metric</th><th>Description</th></tr></thead>
+                    <tbody>
+                        <tr><td><code>certstream_ct_http_seconds</code></td><td>Histogram by bounded endpoint and phase (headers/body), excluding local pacing</td></tr>
+                        <tr><td><code>certstream_ct_http_requests_total</code> / <code>certstream_ct_http_body_errors_total</code></td><td>Response status or pre-header timeout/transport failure; separate body-read errors</td></tr>
+                        <tr><td><code>certstream_ct_response_body_bytes_total</code></td><td>Completed decoded byte/text payloads, not wire bytes; get-sth JSON excluded</td></tr>
+                        <tr><td><code>certstream_ct_entries_returned_total</code> / <code>certstream_ct_entries_processed_total</code></td><td>Decoded entries including replayed prefixes versus advanced entries independent of live dedup; abandoned prefetches excluded from returned entries</td></tr>
+                        <tr><td><code>certstream_ct_head_entries</code> / <code>certstream_ct_read_position</code></td><td>Observed tree size and processed next-entry index, not durable acknowledged position</td></tr>
+                        <tr><td><code>certstream_ct_stage_seconds</code></td><td>Limiter, fetch-next, blocking-pool queue, decode, verification, issuer-fetch, process and NATS-enqueue timings</td></tr>
+                        <tr><td><code>certstream_ct_wait_seconds</code></td><td>Actual poll, backoff, unhealthy, circuit-open and initial-retry sleep time, including interruption</td></tr>
+                        <tr><td><code>certstream_nats_queue_depth</code> / <code>_capacity</code></td><td>Shared publisher queue usage sampled every 250 ms independently of ACK progress</td></tr>
+                        <tr><td><code>certstream_nats_enqueue_seconds</code> / <code>_queue_residence_seconds</code></td><td>Wait for queue space versus time queued before dequeue</td></tr>
+                        <tr><td><code>certstream_nats_publish_seconds</code> / <code>_send_seconds</code> / <code>_ack_seconds</code></td><td>Complete publish attempt, client submission and durable ACK waits, excluding retry sleep</td></tr>
+                        <tr><td><code>certstream_nats_retry_wait_seconds</code></td><td>Actual publisher retry sleep, including interruption</td></tr>
+                    </tbody>
+                </table>
+                <p>Histograms expose <code>_bucket</code>, <code>_sum</code>, and <code>_count</code>. Companion active gauges report work still in progress and balance on cancellation. HTTP timings can include runtime scheduling and buffered-pipeline pauses; compare them with fetch-next and NATS-enqueue timings before attributing delays to upstream. Auxiliary issuer/proof fetching is represented by stage timings, not primary HTTP counters. Concurrent stages overlap, so summed wait seconds are not CPU percentages. Existing fetching policy and durable ACK ordering are unchanged.</p>
                 <h3>Bandwidth</h3>
                 <table class="endpoints-table">
                     <thead><tr><th>Metric</th><th>Type</th><th>Description</th></tr></thead>

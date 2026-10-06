@@ -40,6 +40,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
+use tokio::time::Instant;
 
 use crate::config::{NatsConfig, NatsOnFull};
 
@@ -142,9 +143,66 @@ impl AckTracker {
 /// publisher task.
 #[derive(Clone)]
 pub struct NatsSink {
-    tx: mpsc::Sender<Record>,
+    tx: mpsc::Sender<QueuedRecord>,
     on_full: NatsOnFull,
     pub acks: Arc<AckTracker>,
+    metrics: NatsMetrics,
+}
+
+struct QueuedRecord {
+    record: Record,
+    enqueued_at: Instant,
+}
+
+#[derive(Clone)]
+struct NatsMetrics {
+    enqueue: crate::telemetry::Timing,
+    publish: crate::telemetry::Timing,
+    send: crate::telemetry::Timing,
+    ack: crate::telemetry::Timing,
+    retry: crate::telemetry::Timing,
+    residence: metrics::Histogram,
+    queue_depth: metrics::Gauge,
+}
+
+impl NatsMetrics {
+    fn new(capacity: usize) -> Self {
+        metrics::gauge!("certstream_nats_queue_capacity").set(capacity as f64);
+        let queue_depth = metrics::gauge!("certstream_nats_queue_depth");
+        queue_depth.set(0.0);
+        let timing = |name, active| crate::telemetry::Timing::new(name, active, &[]);
+        Self {
+            enqueue: timing("certstream_nats_enqueue_seconds", "certstream_nats_enqueue_active"),
+            publish: timing("certstream_nats_publish_seconds", "certstream_nats_publish_active"),
+            send: timing("certstream_nats_send_seconds", "certstream_nats_send_active"),
+            ack: timing("certstream_nats_ack_seconds", "certstream_nats_ack_active"),
+            retry: timing("certstream_nats_retry_wait_seconds", "certstream_nats_retry_wait_active"),
+            residence: metrics::histogram!("certstream_nats_queue_residence_seconds"),
+            queue_depth,
+        }
+    }
+}
+
+// Sample independently of publish ACKs, so a stalled publisher cannot hide a
+// full queue. A weak sender does not keep the channel open after watchers exit.
+fn sample_queue(
+    sender: mpsc::WeakSender<QueuedRecord>,
+    depth: metrics::Gauge,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = interval.tick() => {
+                    let Some(sender) = sender.upgrade() else { break };
+                    depth.set((sender.max_capacity() - sender.capacity()) as f64);
+                }
+            }
+        }
+        depth.set(0.0);
+    });
 }
 
 impl NatsSink {
@@ -156,10 +214,20 @@ impl NatsSink {
     /// stores it, so a queue that fills is ingest being told to slow down
     /// rather than records being lost.
     pub async fn publish(&self, record: Record) -> bool {
+        let _timer = self.metrics.enqueue.start();
         match self.on_full {
-            NatsOnFull::Block => self.tx.send(record).await.is_ok(),
-            NatsOnFull::Drop => match self.tx.try_send(record) {
-                Ok(()) => true,
+            NatsOnFull::Block => match self.tx.reserve().await {
+                Ok(permit) => {
+                    permit.send(QueuedRecord { record, enqueued_at: Instant::now() });
+                    true
+                }
+                Err(_) => false,
+            },
+            NatsOnFull::Drop => match self.tx.try_reserve() {
+                Ok(permit) => {
+                    permit.send(QueuedRecord { record, enqueued_at: Instant::now() });
+                    true
+                }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     metrics::counter!("certstream_nats_dropped_total").increment(1);
                     false
@@ -205,21 +273,25 @@ pub async fn start(
 
     let (tx, rx) = mpsc::channel(config.queue_depth);
     let acks = Arc::new(AckTracker::default());
-    spawn_publisher(context, rx, Arc::clone(&acks), config.clone(), cancel);
+    let metrics = NatsMetrics::new(config.queue_depth);
+    sample_queue(tx.downgrade(), metrics.queue_depth.clone(), cancel.clone());
+    spawn_publisher(context, rx, Arc::clone(&acks), config.clone(), cancel, metrics.clone());
 
     Ok(NatsSink {
         tx,
         on_full: config.on_full,
         acks,
+        metrics,
     })
 }
 
 fn spawn_publisher(
     context: jetstream::Context,
-    mut rx: mpsc::Receiver<Record>,
+    mut rx: mpsc::Receiver<QueuedRecord>,
     acks: Arc<AckTracker>,
     config: NatsConfig,
     cancel: CancellationToken,
+    metrics: NatsMetrics,
 ) {
     tokio::spawn(async move {
         let timeout = Duration::from_secs(config.publish_timeout_secs);
@@ -231,10 +303,17 @@ fn spawn_publisher(
                     None => break,
                 },
             };
+            metrics.queue_depth.set(rx.len() as f64);
+            metrics.residence.record(record.enqueued_at.elapsed().as_secs_f64());
+            let record = record.record;
 
             let mut attempt: u32 = 0;
             loop {
-                match store(&context, &record, timeout).await {
+                let result = {
+                    let _timer = metrics.publish.start();
+                    store(&context, &record, timeout, &metrics).await
+                };
+                match result {
                     Ok(()) => {
                         acks.record_ack(&record.log_url, record.index);
                         metrics::counter!("certstream_nats_published_total").increment(1);
@@ -269,6 +348,7 @@ fn spawn_publisher(
                             retry_in_ms = backoff.as_millis() as u64,
                             "JetStream did not store the record; retrying"
                         );
+                        let _timer = metrics.retry.start();
                         tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = tokio::time::sleep(backoff) => {}
@@ -277,6 +357,7 @@ fn spawn_publisher(
                 }
             }
         }
+        metrics.queue_depth.set(0.0);
         info!(pending = acks.pending(), "NATS publisher stopped");
     });
 }
@@ -286,17 +367,22 @@ async fn store(
     context: &jetstream::Context,
     record: &Record,
     timeout: Duration,
+    metrics: &NatsMetrics,
 ) -> Result<(), String> {
     let mut headers = async_nats::HeaderMap::new();
     // Stable across republishes, so a re-read after a restart is the same
     // message to the server rather than a second one.
     headers.insert("Nats-Msg-Id", record.msg_id.as_str());
 
-    let future = context
-        .publish_with_headers(record.subject.clone(), headers, record.payload.clone())
-        .await
-        .map_err(|e| e.to_string())?;
+    let future = {
+        let _timer = metrics.send.start();
+        context
+            .publish_with_headers(record.subject.clone(), headers, record.payload.clone())
+            .await
+            .map_err(|e| e.to_string())?
+    };
 
+    let _timer = metrics.ack.start();
     match tokio::time::timeout(timeout, future.into_future()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
@@ -322,6 +408,140 @@ pub fn report_start_failure(e: &async_nats::Error) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::tests::{recorded, runtime, value};
+
+    fn test_record(index: u64) -> Record {
+        Record {
+            log_url: Arc::from("https://test.invalid/"),
+            msg_id: format!("test:{index}"),
+            index,
+            subject: "test.log".to_owned(),
+            payload: bytes::Bytes::from_static(b"{}"),
+        }
+    }
+
+    fn test_sink(on_full: NatsOnFull) -> (NatsSink, mpsc::Receiver<QueuedRecord>) {
+        let (tx, rx) = mpsc::channel(1);
+        (NatsSink {
+            tx, on_full, acks: Arc::new(AckTracker::default()),
+            metrics: NatsMetrics::new(1),
+        }, rx)
+    }
+
+    #[test]
+    fn full_queue_wait_is_measured_and_cancellation_preserves_fifo() {
+        let snapshot = recorded(|handle| runtime().block_on(async {
+            let (sink, mut rx) = test_sink(NatsOnFull::Block);
+            let cancel = CancellationToken::new();
+            sample_queue(sink.tx.downgrade(), sink.metrics.queue_depth.clone(), cancel.clone());
+            assert!(sink.publish(test_record(0)).await);
+            assert!(tokio::time::timeout(Duration::from_millis(20), sink.publish(test_record(1))).await.is_err());
+            let current = handle.render();
+            assert_eq!(value(&current, "certstream_nats_queue_depth", &[]), 1.0);
+            assert_eq!(value(&current, "certstream_nats_enqueue_active", &[]), 0.0);
+            assert!(value(&current, "certstream_nats_enqueue_seconds_sum", &[]) >= 0.01);
+            assert_eq!(rx.recv().await.unwrap().record.index, 0);
+            assert!(rx.try_recv().is_err(), "cancelled enqueue must not insert a record");
+            assert!(sink.publish(test_record(2)).await);
+            assert_eq!(rx.recv().await.unwrap().record.index, 2);
+            drop(sink);
+            assert!(rx.recv().await.is_none(), "queue sampler must not keep the sender alive");
+            cancel.cancel();
+            tokio::task::yield_now().await;
+        }));
+        assert_eq!(value(&snapshot, "certstream_nats_queue_depth", &[]), 0.0);
+        assert_eq!(value(&snapshot, "certstream_nats_enqueue_seconds_count", &[]), 3.0);
+        assert!(snapshot.contains("certstream_nats_enqueue_seconds_bucket{"));
+    }
+
+    #[test]
+    fn drop_mode_counts_full_queue_without_waiting_or_reordering() {
+        let snapshot = recorded(|_| runtime().block_on(async {
+            let (sink, mut rx) = test_sink(NatsOnFull::Drop);
+            assert!(sink.publish(test_record(0)).await);
+            assert!(!sink.publish(test_record(1)).await);
+            assert_eq!(rx.recv().await.unwrap().record.index, 0);
+            assert!(rx.try_recv().is_err());
+        }));
+        assert_eq!(value(&snapshot, "certstream_nats_dropped_total", &[]), 1.0);
+        assert_eq!(value(&snapshot, "certstream_nats_enqueue_active", &[]), 0.0);
+        assert_eq!(value(&snapshot, "certstream_nats_enqueue_seconds_count", &[]), 2.0);
+    }
+
+    #[test]
+    fn closed_publisher_channel_returns_false_in_both_modes() {
+        for mode in [NatsOnFull::Block, NatsOnFull::Drop] {
+            let snapshot = recorded(|_| runtime().block_on(async {
+                let (sink, rx) = test_sink(mode);
+                drop(rx);
+                assert!(!sink.publish(test_record(0)).await);
+            }));
+            assert_eq!(value(&snapshot, "certstream_nats_enqueue_active", &[]), 0.0);
+        }
+    }
+
+    // A minimal loopback NATS peer that delays the publish ACK. It exercises
+    // the real async-nats client and store() path without a broker or CT traffic.
+    async fn delayed_ack_peer(delay: Duration) -> jetstream::Context {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            writer.write_all(b"INFO {\"server_id\":\"test\",\"version\":\"2.12.0\",\"headers\":true,\"proto\":1,\"max_payload\":1048576}\r\n").await.unwrap();
+            let mut subscriptions: Vec<(String, String)> = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 { break; }
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                match parts.as_slice() {
+                    ["PING"] => { writer.write_all(b"PONG\r\n").await.unwrap(); }
+                    ["SUB", subject, sid] => subscriptions.push(((*subject).to_owned(), (*sid).to_owned())),
+                    ["HPUB", _, reply, _, length] => {
+                        let mut payload = vec![0; length.parse::<usize>().unwrap() + 2];
+                        reader.read_exact(&mut payload).await.unwrap();
+                        let sid = &subscriptions.iter().find(|(subject, _)| reply.starts_with(subject.trim_end_matches('*'))).unwrap().1;
+                        tokio::time::sleep(delay).await;
+                        let ack = r#"{"stream":"TEST","seq":1,"duplicate":false}"#;
+                        let message = format!("MSG {reply} {sid} {}\r\n{ack}\r\n", ack.len());
+                        if writer.write_all(message.as_bytes()).await.is_err() { break; }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let client = async_nats::connect(format!("nats://{address}")).await.unwrap();
+        jetstream::new(client)
+    }
+
+    #[test]
+    fn durable_ack_wait_is_measured_separately_from_submission() {
+        let snapshot = recorded(|_| runtime().block_on(async {
+            let context = delayed_ack_peer(Duration::from_millis(40)).await;
+            let metrics = NatsMetrics::new(1);
+            let _timer = metrics.publish.start();
+            tokio::time::timeout(Duration::from_secs(3), store(&context, &test_record(0), Duration::from_secs(1), &metrics)).await.unwrap().unwrap();
+        }));
+        assert!(value(&snapshot, "certstream_nats_ack_seconds_sum", &[]) >= 0.02);
+        for stage in ["publish", "send", "ack"] {
+            assert_eq!(value(&snapshot, &format!("certstream_nats_{stage}_seconds_count"), &[]), 1.0);
+            assert_eq!(value(&snapshot, &format!("certstream_nats_{stage}_active"), &[]), 0.0);
+        }
+    }
+
+    #[test]
+    fn durable_ack_timeout_is_measured_and_still_returns_an_error() {
+        let snapshot = recorded(|_| runtime().block_on(async {
+            let context = delayed_ack_peer(Duration::from_secs(30)).await;
+            let metrics = NatsMetrics::new(1);
+            let result = tokio::time::timeout(Duration::from_secs(3), store(&context, &test_record(0), Duration::from_millis(20), &metrics)).await.unwrap();
+            assert_eq!(result.unwrap_err(), "ack timed out");
+        }));
+        assert!(value(&snapshot, "certstream_nats_ack_seconds_sum", &[]) >= 0.01);
+        assert_eq!(value(&snapshot, "certstream_nats_ack_active", &[]), 0.0);
+    }
 
     fn tracker_with(url: &str, resume: u64) -> (AckTracker, Arc<str>) {
         let tracker = AckTracker::default();

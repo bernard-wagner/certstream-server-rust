@@ -39,3 +39,5 @@ pub mod rate_limit;
 pub mod sse;
 #[doc(hidden)]
 pub mod tls;
+#[doc(hidden)]
+pub mod telemetry;

@@ -16,10 +16,10 @@ mod rate_limit;
 mod sse;
 mod state;
 mod tls;
+mod telemetry;
 mod websocket;
 
 use axum::{http::header, middleware as axum_middleware, response::IntoResponse, routing::get, Router};
-use metrics_exporter_prometheus::PrometheusBuilder;
 use reqwest::Client;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -168,9 +168,10 @@ async fn main() {
     }
 
     if cli_args.export_metrics {
-        let prometheus_handle = PrometheusBuilder::new()
+        let prometheus_handle = telemetry::prometheus_builder()
             .install_recorder()
             .expect("failed to install prometheus recorder");
+        telemetry::describe_metrics();
         // Initialize all tracked counters to 0 so they appear in the snapshot
         // even before the first real event fires.
         metrics::counter!("certstream_worker_panics").increment(0);
@@ -201,9 +202,10 @@ async fn main() {
 
     spawn_signal_handler(shutdown_token.clone());
 
-    let prometheus_handle = PrometheusBuilder::new()
+    let prometheus_handle = telemetry::prometheus_builder()
         .install_recorder()
         .expect("failed to install prometheus recorder");
+    telemetry::describe_metrics();
 
     // Initialize counters to 0 so they appear in /metrics before the first event.
     // Without this, Prometheus rate() and increase() queries return no data until

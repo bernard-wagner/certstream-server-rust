@@ -27,7 +27,7 @@ fn retry_after_ms(value: &str) -> Option<u64> {
     Some(wait.num_milliseconds().max(0) as u64)
 }
 
-pub(super) fn parse_retry_after(headers: &HeaderMap, log_description: &str) -> u64 {
+pub(crate) fn parse_retry_after(headers: &HeaderMap, log_description: &str) -> u64 {
     let Some(header) = headers.get("retry-after") else {
         return LogHealth::RATE_LIMIT_BACKOFF_MS;
     };
